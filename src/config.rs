@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "aivyx-broker", about = "Multi-process GPU-slot scheduling broker")]
+#[command(
+    name = "aivyx-broker",
+    about = "Multi-process GPU-slot scheduling broker"
+)]
 pub struct BrokerConfig {
     /// Port to bind on 127.0.0.1.
     #[arg(long, env = "AIVYX_BROKER_PORT", default_value_t = 8899)]

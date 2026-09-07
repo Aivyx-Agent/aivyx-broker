@@ -72,8 +72,20 @@ mod tests {
         ]);
         let slots = parse_slots(&body).expect("must parse a real llama-server /slots body");
         assert_eq!(slots.len(), 2);
-        assert_eq!(slots[0], LlamaSlot { id: 0, is_processing: true });
-        assert_eq!(slots[1], LlamaSlot { id: 1, is_processing: false });
+        assert_eq!(
+            slots[0],
+            LlamaSlot {
+                id: 0,
+                is_processing: true
+            }
+        );
+        assert_eq!(
+            slots[1],
+            LlamaSlot {
+                id: 1,
+                is_processing: false
+            }
+        );
     }
 
     #[tokio::test]
@@ -89,7 +101,13 @@ mod tests {
 
         let client = reqwest::Client::new();
         let slots = fetch_slots(&client, &server.uri()).await.unwrap();
-        assert_eq!(slots, vec![LlamaSlot { id: 0, is_processing: false }]);
+        assert_eq!(
+            slots,
+            vec![LlamaSlot {
+                id: 0,
+                is_processing: false
+            }]
+        );
     }
 
     #[tokio::test]
@@ -113,7 +131,10 @@ mod tests {
 
         // Slot 0 must be unavailable (busy-but-unowned); slot 1 must be
         // immediately admittable.
-        let admission = scheduler.admit(None, std::time::Duration::from_millis(50)).await.unwrap();
+        let admission = scheduler
+            .admit(None, std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
         assert_eq!(admission.slot_id, 1);
     }
 }
