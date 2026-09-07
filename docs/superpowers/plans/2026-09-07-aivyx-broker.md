@@ -94,7 +94,7 @@ name = "aivyx-broker"
 path = "src/main.rs"
 
 [dependencies]
-aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", branch = "main" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", branch = "master" }
 axum = "0.8.9"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 futures = "0.3"
