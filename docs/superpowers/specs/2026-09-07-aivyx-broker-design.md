@@ -118,11 +118,19 @@ endpoint, with one additive field:
 
 `aivyx_slot_hint` is optional. Omitting it means "any free slot, prefer
 LRU among idle ones" — the same fallback `KvSlotPool` already implements
-today. `prefix_hash` must be computed with the **same** hash function
-`aivyx-kvcache` already uses for its on-disk slot keys (its existing
-`fnv1a`-based scheme in `llama_server.rs`, made `pub` and reused directly)
-so "which prefix is this" has one canonical definition across the whole
-ecosystem instead of a second, competing identity scheme.
+today. `prefix_hash` is an **opaque string as far as the broker is
+concerned** — each client already computes one locally today (`aivyx`'s
+`compute_prefix_hash` in `llm_planner.rs`, `aivyx-coder`'s equivalent in
+`agent/mod.rs`), already stable per system-prompt+tools combination,
+already used to build their own `CacheKey`s for `aivyx-kvcache`. The
+broker's only requirement is that the *same* client sends the *same*
+string back for the *same* prefix — it never compares one app's hash
+against the other's, so the two apps' hash algorithms never need to match.
+(Earlier drafts of this spec proposed extracting `aivyx-kvcache`'s internal
+`fnv1a` into a shared function for this — that was a mistake, caught during
+implementation planning: that function is a private filename-disambiguation
+detail with no cross-repo stability guarantee, not the actual prefix-hash
+source. No change to `aivyx-kvcache` is needed for this field at all.)
 
 Response is a plain passthrough of `llama-server`'s own SSE stream — the
 broker does not reinterpret token content.
@@ -191,10 +199,12 @@ When enabled:
 
 - `aivyx`'s `llm_planner.rs` and `aivyx-coder`'s `agent/mod.rs` stop calling
   their local `KvSlotPool::checkout()` (or equivalent) entirely on this
-  path — they no longer pick a physical slot number themselves. They
-  compute the prefix hash and let the broker decide. This is a net
-  simplification: today's client-local slot-picking logic becomes dead
-  code on the broker path, replaced by "ask the broker."
+  path — they no longer pick a physical slot number themselves. They reuse
+  the `prefix_hash` they already compute today for `CacheKey` (via each
+  app's own existing `compute_prefix_hash`) as the hint's `prefix_hash`,
+  and let the broker decide the slot. This is a net simplification: today's
+  client-local slot-picking logic becomes dead code on the broker path,
+  replaced by "ask the broker."
 - The existing direct-to-`llama-server` mode (today's default) is
   unchanged — this is a new opt-in path, not a replacement.
 
