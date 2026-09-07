@@ -1,0 +1,29 @@
+[package]
+name = "aivyx-broker"
+description = "Multi-process GPU-slot scheduling broker for local llama-server deployments"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "aivyx-broker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", branch = "master" }
+axum = "0.8.9"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+futures = "0.3"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "test-util"] }
+wiremock = "0.6.5"
