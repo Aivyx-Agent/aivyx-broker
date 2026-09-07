@@ -15,14 +15,20 @@ async fn main() -> anyhow::Result<()> {
     // A wedged llama-server must not hold a slot forever, but a blanket
     // request timeout would abort legitimate long-running streamed
     // generations mid-stream. `connect_timeout` bounds only the initial
-    // TCP/TLS handshake; `read_timeout` is a per-read inactivity timeout
-    // that resets on every chunk received, so an actively-streaming (if
-    // slow) generation is unaffected -- only a connection truly stalled
-    // with no bytes for 30s trips it. One client, shared by the HTTP
-    // routes and the reconciliation task below (Fix 5).
+    // TCP/TLS handshake. `read_timeout` in reqwest bounds the time since
+    // the *last byte was read* -- which includes the wait for the very
+    // first response byte (headers included), not just inter-chunk gaps
+    // during an already-started stream. For this broker that first wait
+    // covers real prompt-processing time before llama-server sends
+    // anything back at all, which routinely exceeds 30s for a large
+    // system prompt + tools on a loaded local GPU -- especially on the
+    // cold-cache warm-up path this broker itself issues. 300s is generous
+    // enough for realistic prompt-processing + generation stalls without
+    // being unbounded. One client, shared by the HTTP routes and the
+    // reconciliation task below (Fix 5).
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(300))
         .build()?;
 
     // Fetch the real slot count first -- the Scheduler is constructed

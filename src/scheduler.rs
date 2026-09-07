@@ -140,19 +140,26 @@ impl Scheduler {
     /// out from under its holder.
     ///
     /// Deliberately does *not* touch `resident_prefix` (a seeded slot's
-    /// prefix was already unknown -- `seed_busy` never set one) and
-    /// deliberately does *not* wake any queue: a slot leaving the
-    /// seeded-unowned state simply becomes available for the next
-    /// `try_admit_locked` attempt, exactly like any other idle slot that
-    /// was never contended for. Waking a queue here would be reaching for
-    /// `release()`'s queue-notification behavior for a slot that was never
-    /// actually held by anyone this broker knows about.
+    /// prefix was already unknown -- `seed_busy` never set one). When this
+    /// call actually performs the busy -> free transition, it wakes queued
+    /// waiters exactly like `release()` does (see `wake_waiters_for` and
+    /// Finding 2): a waiter may already be queued -- on this slot
+    /// specifically, or on `global_waiters` -- for a slot that just became
+    /// free by this route rather than via `release()`, and without waking
+    /// them they'd sit idle until their own queue timeout even though the
+    /// slot they wanted is now available.
     pub fn reconcile_seeded_idle(&self, slot_id: u32) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(slot) = inner.slots.get_mut(slot_id as usize)
+        let became_free = if let Some(slot) = inner.slots.get_mut(slot_id as usize)
             && slot.seeded_unowned
         {
             slot.busy = false;
+            true
+        } else {
+            false
+        };
+        if became_free {
+            Self::wake_waiters_for(&mut inner, slot_id);
         }
     }
 
@@ -175,7 +182,21 @@ impl Scheduler {
                     Some(admission) => return Ok(admission),
                     None => {
                         let (tx, rx) = oneshot::channel();
-                        match hint.as_ref().and_then(|h| h.preferred_slot) {
+                        // Same out-of-range filtering as `try_admit_locked`
+                        // (Fix 4/Finding 1): a `preferred_slot` that's out
+                        // of range for the current slot count must never be
+                        // used as a `slot_waiters` key, because nothing
+                        // will ever pop it -- `release()` only drains
+                        // `slot_waiters` for slot ids that actually exist.
+                        // Queuing there strands the caller for the full
+                        // timeout even when a different slot frees up.
+                        // Treat it exactly like no preference: queue on
+                        // `global_waiters` instead.
+                        match hint
+                            .as_ref()
+                            .and_then(|h| h.preferred_slot)
+                            .filter(|&slot_id| (slot_id as usize) < inner.slots.len())
+                        {
                             Some(slot_id) => {
                                 inner.slot_waiters.entry(slot_id).or_default().push_back(tx)
                             }
@@ -283,24 +304,10 @@ impl Scheduler {
     }
 
     /// Frees `slot_id` and wakes every waiter queued for it (both this
-    /// slot's specific queue and the global "any free slot" queue) with a
-    /// bare wake *signal*, never a handed-off slot id. The slot is left
-    /// `busy = false` here unconditionally.
-    ///
-    /// Waking every queued waiter, not just the first, is deliberate (Fix
-    /// 3): stopping after the first *successful* `send()` leaves a narrow
-    /// but real starvation window. If that first waiter's future is
-    /// dropped (client disconnect) in the window between `send()`
-    /// succeeding and that waiter being re-polled, no one else in the
-    /// queue is ever notified even though the slot is sitting free -- the
-    /// next queued waiter silently starves until its own timeout. Since
-    /// the wake payload is bare `()` and every waiter re-validates by
-    /// calling `try_admit_locked` itself under a fresh lock upon waking
-    /// (see `admit()`), waking more than one is safe: only whichever one
-    /// wins the race to re-lock first actually succeeds, the rest simply
-    /// re-queue and keep waiting. This trades strict FIFO ordering for
-    /// eliminating the starvation window entirely -- admission is
-    /// approximately FIFO by arrival order, not strictly ordered.
+    /// slot's specific queue and the global "any free slot" queue) via
+    /// `wake_waiters_for` -- see that method's doc comment for why waking
+    /// every queued waiter, not just the first, is deliberate. The slot is
+    /// left `busy = false` here unconditionally.
     ///
     /// This is deliberate: the previous design sent the slot id itself as
     /// the oneshot payload and marked the slot busy on the sender's side,
@@ -324,15 +331,39 @@ impl Scheduler {
         } else {
             return;
         }
+        Self::wake_waiters_for(&mut inner, slot_id);
+    }
 
+    /// Wakes every waiter queued for `slot_id` (both this slot's specific
+    /// queue and the global "any free slot" queue) with a bare wake
+    /// *signal*, never a handed-off slot id. Shared by `release()` and
+    /// `reconcile_seeded_idle` (Finding 2) -- both are places where a slot
+    /// transitions from busy to free and any queued waiter needs a chance
+    /// to retry, not just `release()`'s own callers.
+    ///
+    /// Waking every queued waiter, not just the first, is deliberate (Fix
+    /// 3): stopping after the first *successful* `send()` leaves a narrow
+    /// but real starvation window. If that first waiter's future is
+    /// dropped (client disconnect) in the window between `send()`
+    /// succeeding and that waiter being re-polled, no one else in the
+    /// queue is ever notified even though the slot is sitting free -- the
+    /// next queued waiter silently starves until its own timeout. Since
+    /// the wake payload is bare `()` and every waiter re-validates by
+    /// calling `try_admit_locked` itself under a fresh lock upon waking
+    /// (see `admit()`), waking more than one is safe: only whichever one
+    /// wins the race to re-lock first actually succeeds, the rest simply
+    /// re-queue and keep waiting. This trades strict FIFO ordering for
+    /// eliminating the starvation window entirely -- admission is
+    /// approximately FIFO by arrival order, not strictly ordered.
+    fn wake_waiters_for(inner: &mut Inner, slot_id: u32) {
         // Wake this slot's specific waiters first (rule: don't let a
         // global waiter steal a slot someone is specifically waiting on).
         // Drain the entire queue -- do NOT return after the first
-        // successful send (see this method's doc comment for why: a
-        // wake that succeeds but is never re-polled before the waiter's
-        // future is dropped would otherwise strand everyone behind it).
-        // Best-effort: ignore individual send failures (a `Receiver`
-        // already dropped from timing out or being cancelled).
+        // successful send (see above for why: a wake that succeeds but is
+        // never re-polled before the waiter's future is dropped would
+        // otherwise strand everyone behind it). Best-effort: ignore
+        // individual send failures (a `Receiver` already dropped from
+        // timing out or being cancelled).
         if let Some(queue) = inner.slot_waiters.get_mut(&slot_id) {
             while let Some(tx) = queue.pop_front() {
                 let _ = tx.send(());
@@ -723,6 +754,90 @@ mod tests {
         .expect("admit() should not hang the full queue timeout for an out-of-range preferred_slot")
         .unwrap();
         assert!(admission.slot_id < 2);
+    }
+
+    // --- Finding 1 (blocking, review round 3): out-of-range
+    // preferred_slot must not hang the full timeout under contention -----
+
+    #[tokio::test]
+    async fn out_of_range_preferred_slot_under_contention_falls_back_instead_of_hanging() {
+        // Regression for Finding 1: `try_admit_locked` already filtered an
+        // out-of-range `preferred_slot` down to "no preference" -- but only
+        // reachable when it actually runs. When every slot is already
+        // busy, `try_admit_locked` returns `None` for the ordinary reason
+        // "nothing free right now," and `admit()`'s own queue-selection
+        // logic used to re-read the *raw* `preferred_slot` straight off the
+        // hint, queuing this caller on `slot_waiters[99]` -- a key
+        // `release()` can never pop for a 2-slot broker. That stranded the
+        // caller for its entire queue timeout even though a slot freed up
+        // well before then.
+        let sched = Scheduler::new(2);
+
+        // Occupy both slots first so `try_admit_locked` returns `None` for
+        // "nothing idle," not for the out-of-range check -- the prior test
+        // (`out_of_range_preferred_slot_falls_back_instead_of_hanging_the_full_timeout`)
+        // only covers the case where a slot IS free, which doesn't reach
+        // this bug at all.
+        let held_a = sched.admit(None, Duration::from_secs(1)).await.unwrap();
+        let _held_b = sched.admit(None, Duration::from_secs(1)).await.unwrap();
+
+        let hint = Some(SlotHint {
+            prefix_hash: "p".to_string(),
+            preferred_slot: Some(99),
+        });
+        let sched2 = sched.clone();
+        let waiter = tokio::spawn(async move { sched2.admit(hint, Duration::from_secs(60)).await });
+
+        // Give the waiter time to register itself in the (correct) queue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Free one of the two occupied slots.
+        sched.release(held_a.slot_id);
+
+        // The waiter must be admitted promptly -- well before its 60s
+        // timeout -- not stuck on a `slot_waiters[99]` key nothing pops.
+        let admission = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should be admitted promptly after a slot frees, not hang on a dead out-of-range queue key")
+            .unwrap()
+            .unwrap();
+        assert!(admission.slot_id < 2);
+    }
+
+    // --- Finding 2 (high, review round 3): seed-busy reconciliation must
+    // wake waiters when it frees a slot -----------------------------------
+
+    #[tokio::test]
+    async fn reconcile_seeded_idle_wakes_a_queued_waiter() {
+        // Regression for Finding 2: `reconcile_seeded_idle` correctly flips
+        // `busy` to `false` for a still-seeded-unowned slot, but previously
+        // woke no one -- any waiter already queued (global or
+        // slot-specific) for that slot sat there until its own timeout
+        // even though the slot it wanted just became free.
+        let sched = Scheduler::new(1);
+        sched.seed_busy(0);
+
+        // Queue a waiter (global, no preference) behind the seeded-busy
+        // slot, with a long timeout so the test fails fast (not slow) if
+        // the wake never happens.
+        let sched2 = sched.clone();
+        let waiter = tokio::spawn(async move { sched2.admit(None, Duration::from_secs(60)).await });
+
+        // Give the waiter time to register itself in the global queue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Background reconciliation observes llama-server now reports the
+        // slot idle.
+        sched.reconcile_seeded_idle(0);
+
+        // The waiter must be admitted promptly -- well before its 60s
+        // timeout -- not only reflected in `snapshot()`'s busy flag.
+        let admission = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should be woken promptly by reconcile_seeded_idle, not stranded until its own timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.slot_id, 0);
     }
 
     // --- Fix 7: clear_resident ------------------------------------------
