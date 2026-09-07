@@ -34,6 +34,17 @@ cargo run -- --llama-server-url http://127.0.0.1:8080 --kvcache-store-path ~/.lo
 Loopback-only, no auth — same trust model as `llama-server` itself. Not
 safe to expose beyond `127.0.0.1`.
 
+## Known, deliberately-undefended limitations
+
+- Loopback-only, no auth. Not safe to expose beyond `127.0.0.1`.
+- No priority/weighted scheduling — pure FIFO in v1.
+- No persisted broker state across restarts (by design — see the spec's
+  "Broker startup/restart" section); a restart loses cross-process
+  fairness bookkeeping but never desyncs from `llama-server`'s own
+  physical reality.
+- No automatic lifecycle management (auto-spawn, systemd unit
+  generation) — started manually, same as `llama-server` itself.
+
 ## Where to look next
 
 - `README.md` — setup and config reference.
