@@ -1380,9 +1380,11 @@ that).
   `{"prefix_hash": "...", "preferred_slot": <u32 or null>}`. Omit it for
   plain "any free slot" behavior.
 - `GET /status` — broker health + which `llama-server` it's proxying to.
-- `GET /slots` — the broker's own occupancy view (superset of
-  `llama-server`'s own `/slots`, adding cross-process attribution
-  `llama-server` has no notion of).
+- `GET /slots` — the broker's own occupancy view: per-slot busy/idle plus
+  the currently-resident prefix the broker itself tracked into that slot
+  (not a cross-process attribution `llama-server` has no notion of — the
+  broker doesn't know which process/request owns a slot, only what prefix
+  it last admitted there).
 
 ## Honest tradeoffs
 
@@ -1390,8 +1392,11 @@ that).
   becomes as load-bearing as `llama-server` itself — if it's down, both
   client apps see connection-refused. This is an accepted cost of
   centralizing coordination, not a bug.
-- **No priority/weighted scheduling in v1.** Pure FIFO by arrival order.
-  Deferred as a future increment.
+- **No priority/weighted scheduling in v1.** Admission is approximately
+  FIFO by arrival order, no starvation guarantee beyond each request's own
+  queue timeout — under contention, a released slot's queued waiters race
+  to reclaim it rather than being served in strict order. Deferred as a
+  future increment.
 - **No real multi-process race test exists.** This project's own test
   suite has no way to run two genuine OS processes contending for one
   genuine `llama-server` — verified with fakes/mocks only. Manual
@@ -1406,7 +1411,10 @@ that).
 ## Known, deliberately-undefended limitations
 
 - Loopback-only, no auth. Not safe to expose beyond `127.0.0.1`.
-- No priority/weighted scheduling — pure FIFO in v1.
+- No priority/weighted scheduling in v1. Admission is approximately FIFO
+  by arrival order — under contention, a released slot's queued waiters
+  race to reclaim it rather than being served in strict order, so there's
+  no hard ordering guarantee beyond each request's own queue timeout.
 - No persisted broker state across restarts (by design — see the spec's
   "Broker startup/restart" section); a restart loses cross-process
   fairness bookkeeping but never desyncs from `llama-server`'s own

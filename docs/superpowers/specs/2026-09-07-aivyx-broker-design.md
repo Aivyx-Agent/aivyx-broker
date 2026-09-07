@@ -167,12 +167,15 @@ Response is a plain passthrough of `llama-server`'s own SSE stream — the
 broker does not reinterpret token content.
 
 **`GET /status`** — broker health, which `llama-server` it's proxying to,
-current queue depth.
+and a `queue_depth` field. In v1 this is a fixed placeholder (always `0`),
+not real queue-depth tracking — an explicit YAGNI scope-cut from the plan,
+not a bug; real tracking is deferred to a later increment.
 
-**`GET /slots`** — the broker's own occupancy view (slot → holder process
-label, prefix hash, busy/idle, queue position if contested) — a superset of
-`llama-server`'s own `/slots`, adding the cross-process attribution
-`llama-server` has no notion of.
+**`GET /slots`** — the broker's own occupancy view (slot busy/idle plus the
+currently-resident prefix hash the broker itself last admitted into that
+slot) — a superset of `llama-server`'s own `/slots` in that sense, but not
+a cross-process attribution: the broker doesn't track which process or
+request owns a given slot, only what prefix it last placed there.
 
 **Admission semantics on `/v1/chat/completions`:**
 
