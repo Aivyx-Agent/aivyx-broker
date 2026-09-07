@@ -4,10 +4,17 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SlotHint {
     pub prefix_hash: String,
     pub preferred_slot: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SlotSnapshot {
+    pub slot_id: u32,
+    pub busy: bool,
+    pub resident_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +153,21 @@ impl Scheduler {
         Some(Admission { slot_id: idx as u32, cache_ready })
     }
 
+    /// The broker's own occupancy view -- used by the `GET /slots` route.
+    pub fn snapshot(&self) -> Vec<SlotSnapshot> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| SlotSnapshot {
+                slot_id: idx as u32,
+                busy: s.busy,
+                resident_prefix: s.resident_prefix.clone(),
+            })
+            .collect()
+    }
+
     pub fn release(&self, slot_id: u32) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(slot_id as usize) {
@@ -246,6 +268,18 @@ mod tests {
         sched.release(0);
         let admission = sched.admit(None, Duration::from_secs(1)).await.unwrap();
         assert_eq!(admission.slot_id, 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_busy_and_resident_state() {
+        let sched = Scheduler::new(2);
+        let admission = sched.admit(None, Duration::from_secs(1)).await.unwrap();
+        sched.mark_resident(admission.slot_id, "p".to_string());
+
+        let snap = sched.snapshot();
+        let this_slot = snap.iter().find(|s| s.slot_id == admission.slot_id).unwrap();
+        assert!(this_slot.busy);
+        assert_eq!(this_slot.resident_prefix.as_deref(), Some("p"));
     }
 
     #[tokio::test]

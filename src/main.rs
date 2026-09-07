@@ -1,4 +1,3 @@
-use axum::{routing::get, Router};
 use clap::Parser;
 
 #[tokio::main]
@@ -20,15 +19,23 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(num_slots = slots.len(), "seeded scheduler from real llama-server /slots");
 
-    let app = Router::new().route("/status", get(status));
+    let kv_store = aivyx_kvcache::LlamaServerSlotStore::open(
+        &config.kvcache_store_path,
+        config.llama_server_url.clone(),
+        config.kvcache_max_bytes,
+    )?;
+    let state = aivyx_broker::server::AppState {
+        scheduler,
+        http: http_client,
+        llama_server_url: config.llama_server_url.clone(),
+        kv_store: std::sync::Arc::new(kv_store),
+        queue_timeout: std::time::Duration::from_secs(config.queue_timeout_secs),
+    };
+    let app = aivyx_broker::server::build_router(state);
 
     let addr = format!("127.0.0.1:{}", config.port);
     tracing::info!(%addr, llama_server_url = %config.llama_server_url, "aivyx-broker starting");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn status() -> &'static str {
-    "ok"
 }
