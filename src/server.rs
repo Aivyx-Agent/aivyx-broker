@@ -151,11 +151,34 @@ async fn handle_admitted(
         .post(format!("{}/v1/chat/completions", state.llama_server_url.trim_end_matches('/')))
         .json(body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
 
+    // Relay llama-server's response untouched: real status code, real
+    // headers, real body -- whether it succeeded or not. Deliberately does
+    // *not* call `.error_for_status()`, which would discard the upstream
+    // status/body and collapse every non-2xx into a generic broker error.
+    let status = resp.status();
+    let headers = resp.headers().clone();
+
+    if !status.is_success() {
+        // Non-streaming error path: read the whole body so it can be
+        // forwarded byte-for-byte, then release the slot (via `guard`
+        // dropping at the end of this function) instead of holding it for
+        // a stream that was never started.
+        let bytes = resp.bytes().await?;
+        let mut builder = axum::response::Response::builder().status(status);
+        for (name, value) in headers.iter() {
+            builder = builder.header(name, value);
+        }
+        return Ok(builder.body(axum::body::Body::from(bytes))?);
+    }
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (name, value) in headers.iter() {
+        builder = builder.header(name, value);
+    }
     let axum_body = axum::body::Body::from_stream(release_on_stream_end(resp.bytes_stream(), guard));
-    Ok(axum::response::Response::builder().status(StatusCode::OK).body(axum_body)?)
+    Ok(builder.body(axum_body)?)
 }
 
 async fn warm_or_restore(
@@ -183,12 +206,21 @@ async fn warm_or_restore(
             .and_then(|arr| arr.iter().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")))
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"role": "system", "content": ""}));
+        let tools = body.get("tools").cloned();
 
-        let warm_up = serde_json::json!({
+        let mut warm_up = serde_json::json!({
             "messages": [system_message, {"role": "user", "content": ""}],
             "max_tokens": 1,
             "id_slot": slot_id,
         });
+        // The stable "prefix" that gets cached under `prefix_hash` is
+        // system-prompt-plus-tools together (see design spec). Omitting
+        // `tools` here would warm/save a prefix that doesn't match what a
+        // real request for the same `prefix_hash` actually sends,
+        // defeating the cache.
+        if let Some(tools) = tools {
+            warm_up["tools"] = tools;
+        }
         state
             .http
             .post(format!("{}/v1/chat/completions", state.llama_server_url.trim_end_matches('/')))
@@ -305,6 +337,157 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         // Warm-up + real forward = at least 2 calls to llama-server.
         assert!(requests.len() >= 2, "expected warm-up + forward, got {}", requests.len());
+    }
+
+    #[tokio::test]
+    async fn llama_server_error_status_and_body_are_forwarded_untouched() {
+        // Finding 1: the broker must forward llama-server's real non-2xx
+        // status code and body, not collapse everything into a generic
+        // broker 502 via `.error_for_status()`.
+        let server = MockServer::start().await;
+        let upstream_error_body = serde_json::json!({
+            "error": {"message": "slot is busy", "type": "server_error"}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(upstream_error_body.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let (mut state, _dir) = test_state(server.uri()).await;
+        state.llama_server_url = server.uri();
+        let app = build_router(state);
+
+        // No `aivyx_slot_hint` -- goes straight to forwarding with no
+        // warm-up call, so the mock above is hit exactly once and there's
+        // no ambiguity about which response we're checking.
+        let req_body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, upstream_error_body);
+    }
+
+    #[tokio::test]
+    async fn llama_server_response_headers_are_forwarded() {
+        // Finding 2: the broker must copy upstream response headers (and
+        // the real status code) onto its own response, per the design's
+        // "relay untouched" requirement -- not hardcode 200 with no
+        // headers copied.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-llama-server-marker", "from-upstream")
+                    .set_body_json(serde_json::json!({
+                        "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let (mut state, _dir) = test_state(server.uri()).await;
+        state.llama_server_url = server.uri();
+        let app = build_router(state);
+
+        // No `aivyx_slot_hint` -- forward call only, no warm-up call to
+        // confuse which response's headers are being asserted on.
+        let req_body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-llama-server-marker").map(|v| v.to_str().unwrap()),
+            Some("from-upstream"),
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_up_request_includes_tools_from_the_real_client_request() {
+        // Finding 3: the design's own definition of the stable "prefix"
+        // that gets cached under `prefix_hash` is system-prompt-plus-tools
+        // together. The synthetic warm-up request must include the
+        // client's real `tools` array, or the content actually cached
+        // won't match what real requests for that same `prefix_hash` send.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"delta": {"content": ""}, "finish_reason": "length"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let (mut state, _dir) = test_state(server.uri()).await;
+        state.llama_server_url = server.uri();
+        let app = build_router(state);
+
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+        ]);
+        let req_body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": tools,
+            "aivyx_slot_hint": {"prefix_hash": "abc123", "preferred_slot": null}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let requests = server.received_requests().await.unwrap();
+        // The warm-up request is identifiable by its `max_tokens: 1` /
+        // `id_slot` shape (see `warm_or_restore`); the real forwarded
+        // request is the other one.
+        let warm_up = requests
+            .iter()
+            .map(|r| r.body_json::<serde_json::Value>().unwrap())
+            .find(|b| b.get("max_tokens") == Some(&serde_json::json!(1)))
+            .expect("expected a warm-up request among those received");
+        assert_eq!(
+            warm_up.get("tools"),
+            Some(&tools),
+            "warm-up request must include the client's real `tools` array"
+        );
     }
 
     #[tokio::test]

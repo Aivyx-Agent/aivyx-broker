@@ -37,10 +37,13 @@ struct SlotState {
 
 struct Inner {
     slots: Vec<SlotState>,
-    /// FIFO waiters for a specific slot id.
-    slot_waiters: HashMap<u32, VecDeque<oneshot::Sender<u32>>>,
-    /// FIFO waiters for "any free slot".
-    global_waiters: VecDeque<oneshot::Sender<u32>>,
+    /// FIFO waiters for a specific slot id. Each sender carries a bare wake
+    /// signal, not a slot id -- see `release()`'s doc comment for why
+    /// ownership is never handed off on the sender's behalf.
+    slot_waiters: HashMap<u32, VecDeque<oneshot::Sender<()>>>,
+    /// FIFO waiters for "any free slot". Same bare-wake-signal contract as
+    /// `slot_waiters`.
+    global_waiters: VecDeque<oneshot::Sender<()>>,
 }
 
 /// In-memory, in-process (single `aivyx-broker` instance) slot admission
@@ -85,38 +88,49 @@ impl Scheduler {
         }
     }
 
+    /// Admits `hint` (or waits for a slot if none is free), retrying under
+    /// lock every time a wake signal arrives rather than trusting `release`
+    /// to have handed a specific slot to this call. See `release()`'s doc
+    /// comment for why: a wake signal carries no slot id and has no effect
+    /// on scheduler state by itself, so it's always safe -- and necessary
+    /// -- to re-derive admission from scratch after being woken.
     pub async fn admit(
         &self,
         hint: Option<SlotHint>,
         timeout: Duration,
     ) -> Result<Admission, SchedulerError> {
-        let rx = {
-            let mut inner = self.inner.lock().unwrap();
-            match Self::try_admit_locked(&mut inner, &hint) {
-                Some(admission) => return Ok(admission),
-                None => {
-                    let (tx, rx) = oneshot::channel();
-                    match hint.as_ref().and_then(|h| h.preferred_slot) {
-                        Some(slot_id) => {
-                            inner.slot_waiters.entry(slot_id).or_default().push_back(tx)
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let rx = {
+                let mut inner = self.inner.lock().unwrap();
+                match Self::try_admit_locked(&mut inner, &hint) {
+                    Some(admission) => return Ok(admission),
+                    None => {
+                        let (tx, rx) = oneshot::channel();
+                        match hint.as_ref().and_then(|h| h.preferred_slot) {
+                            Some(slot_id) => {
+                                inner.slot_waiters.entry(slot_id).or_default().push_back(tx)
+                            }
+                            None => inner.global_waiters.push_back(tx),
                         }
-                        None => inner.global_waiters.push_back(tx),
+                        rx
                     }
-                    rx
                 }
-            }
-        };
+            };
 
-        let prefix_hash = hint.map(|h| h.prefix_hash);
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(slot_id)) => {
-                let cache_ready = {
-                    let inner = self.inner.lock().unwrap();
-                    prefix_hash.as_deref() == inner.slots[slot_id as usize].resident_prefix.as_deref()
-                };
-                Ok(Admission { slot_id, cache_ready })
+            // Wait for a bare wake signal (not a slot id -- see
+            // `release()`). On wake, don't assume ownership of any
+            // specific slot: loop back and re-acquire the lock to retry
+            // the exact same admission attempt from scratch. This is what
+            // makes a wake signal that nobody ever received (because this
+            // future itself got dropped before reaching here) harmless to
+            // scheduler state -- it never marked any slot busy on the
+            // dropped waiter's behalf, so the slot stays free for the next
+            // attempt to claim.
+            match tokio::time::timeout_at(deadline, rx).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) | Err(_) => return Err(SchedulerError::Timeout),
             }
-            Ok(Err(_)) | Err(_) => Err(SchedulerError::Timeout),
         }
     }
 
@@ -168,6 +182,25 @@ impl Scheduler {
             .collect()
     }
 
+    /// Frees `slot_id` and, if anyone is waiting, wakes exactly one
+    /// waiter -- but only with a bare wake *signal*, never a handed-off
+    /// slot id. The slot is left `busy = false` here unconditionally.
+    ///
+    /// This is deliberate: the previous design sent the slot id itself as
+    /// the oneshot payload and marked the slot busy on the sender's side,
+    /// which handed ownership to a waiter before that waiter's own future
+    /// was ever polled again. If that future was dropped in the window
+    /// between `send()` succeeding and being polled (e.g. Axum drops the
+    /// connection handler because the client disconnected), the sent
+    /// value was silently discarded along with the dropped `Receiver`,
+    /// but the slot stayed marked busy forever -- a permanent leak with no
+    /// owner and no way to release it.
+    ///
+    /// With a bare `()` wake signal, `release()` never mutates `busy` on a
+    /// waiter's behalf. A woken `admit()` call re-acquires the lock itself
+    /// and retries admission (see `admit()`); if it was already dropped,
+    /// the wake goes nowhere and the slot simply stays free, exactly as if
+    /// it had never been claimed by anyone.
     pub fn release(&self, slot_id: u32) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(slot_id as usize) {
@@ -178,25 +211,26 @@ impl Scheduler {
 
         // Wake this slot's specific waiters first (rule: don't let a
         // global waiter steal a slot someone is specifically waiting on).
-        // Loop through slot-specific waiters until one successfully receives,
-        // skipping any that have already timed out.
+        // Loop through slot-specific waiters until one successfully
+        // receives the wake signal, skipping any whose `Receiver` was
+        // already dropped (timed out, or the waiter's future was
+        // cancelled).
         if let Some(queue) = inner.slot_waiters.get_mut(&slot_id) {
             while let Some(tx) = queue.pop_front() {
-                if tx.send(slot_id).is_ok() {
-                    inner.slots[slot_id as usize].busy = true;
+                if tx.send(()).is_ok() {
                     return;
                 }
-                // This waiter timed out; continue to the next one.
+                // This waiter is gone; continue to the next one. `busy`
+                // stays false -- nothing was ever handed to it.
             }
         }
 
         // No slot-specific waiter accepted; try global waiters.
         while let Some(tx) = inner.global_waiters.pop_front() {
-            if tx.send(slot_id).is_ok() {
-                inner.slots[slot_id as usize].busy = true;
+            if tx.send(()).is_ok() {
                 return;
             }
-            // This waiter timed out; continue to the next one.
+            // This waiter is gone; continue to the next one.
         }
     }
 }
@@ -337,5 +371,53 @@ mod tests {
         // The second waiter should be admitted.
         let second_result = second_waiter.await.unwrap().unwrap();
         assert_eq!(second_result.slot_id, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_woken_waiter_before_repolling_does_not_leak_the_slot() {
+        // Regression test for Finding 4 (Task 4 review): release() used to
+        // hand a slot off to a queued waiter unconditionally -- marking it
+        // busy and sending the slot id as the oneshot payload -- before
+        // that waiter's own future was ever polled again. If the future
+        // was dropped in the window between `send()` succeeding and being
+        // re-polled (e.g. Axum drops the connection handler because the
+        // client disconnected), the sent value was silently discarded
+        // along with the dropped `Receiver`, but the slot stayed marked
+        // busy forever: a permanent, unrecoverable leak.
+        let sched = Scheduler::new(1);
+        let held = sched.admit(None, Duration::from_secs(5)).await.unwrap();
+
+        // Queue a second admit() call for the only slot. Poll it exactly
+        // once, by hand, so it runs up through registering itself as a
+        // waiter and suspending on its oneshot receiver -- without ever
+        // spawning it onto a runtime that might poll it again on its own.
+        let sched2 = sched.clone();
+        let mut waiter = Box::pin(sched2.admit(None, Duration::from_secs(5)));
+        assert!(
+            futures::poll!(&mut waiter).is_pending(),
+            "waiter should have nothing to admit to yet -- the only slot is held"
+        );
+
+        // release() hands off: under the old design this would mark the
+        // slot busy on the waiter's behalf and send it the slot id; under
+        // the fix it only sends a bare wake signal and leaves `busy`
+        // alone (the slot was already freed at the top of `release()`).
+        sched.release(held.slot_id);
+
+        // Simulate the client disconnecting: the waiter's future is
+        // dropped *without ever being polled again* to receive that wake
+        // signal and re-claim the slot.
+        drop(waiter);
+
+        // The slot must be free for the next caller, not stuck busy
+        // forever with no owner and no way to release it.
+        let snap = sched.snapshot();
+        let slot = snap.iter().find(|s| s.slot_id == held.slot_id).unwrap();
+        assert!(!slot.busy, "slot leaked: still busy after its woken waiter was dropped unpolled");
+
+        // And it must actually be admittable again, not just cosmetically
+        // "not busy" in the snapshot.
+        let fresh = sched.admit(None, Duration::from_secs(1)).await;
+        assert!(fresh.is_ok(), "slot should still be admittable after the leak repro");
     }
 }
