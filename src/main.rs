@@ -1,10 +1,29 @@
+use std::time::Duration;
+
 use clap::Parser;
+
+/// How often the background reconciliation task polls `llama-server`'s
+/// real `/slots` to clear out seeded-busy-but-unowned slots that have
+/// since gone idle. See `Scheduler::reconcile_seeded_idle` (Fix 1).
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let config = aivyx_broker::BrokerConfig::parse();
-    let http_client = reqwest::Client::new();
+
+    // A wedged llama-server must not hold a slot forever, but a blanket
+    // request timeout would abort legitimate long-running streamed
+    // generations mid-stream. `connect_timeout` bounds only the initial
+    // TCP/TLS handshake; `read_timeout` is a per-read inactivity timeout
+    // that resets on every chunk received, so an actively-streaming (if
+    // slow) generation is unaffected -- only a connection truly stalled
+    // with no bytes for 30s trips it. One client, shared by the HTTP
+    // routes and the reconciliation task below (Fix 5).
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(30))
+        .build()?;
 
     // Fetch the real slot count first -- the Scheduler is constructed
     // once we know it, then seeded from the same response.
@@ -17,7 +36,10 @@ async fn main() -> anyhow::Result<()> {
             scheduler.seed_busy(slot.id);
         }
     }
-    tracing::info!(num_slots = slots.len(), "seeded scheduler from real llama-server /slots");
+    tracing::info!(
+        num_slots = slots.len(),
+        "seeded scheduler from real llama-server /slots"
+    );
 
     let kv_store = aivyx_kvcache::LlamaServerSlotStore::open(
         &config.kvcache_store_path,
@@ -25,8 +47,8 @@ async fn main() -> anyhow::Result<()> {
         config.kvcache_max_bytes,
     )?;
     let state = aivyx_broker::server::AppState {
-        scheduler,
-        http: http_client,
+        scheduler: scheduler.clone(),
+        http: http_client.clone(),
         llama_server_url: config.llama_server_url.clone(),
         kv_store: std::sync::Arc::new(kv_store),
         queue_timeout: std::time::Duration::from_secs(config.queue_timeout_secs),
@@ -36,6 +58,46 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{}", config.port);
     tracing::info!(%addr, llama_server_url = %config.llama_server_url, "aivyx-broker starting");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    // Background reconciliation (Fix 1): a slot seeded busy-but-unowned at
+    // startup has no `ReleaseGuard` -- the broker never admitted a
+    // request onto it, so nothing will ever call `release()` for it. Poll
+    // llama-server's real `/slots` periodically and clear any such slot
+    // once llama-server itself reports it idle, so a broker restart that
+    // catches llama-server mid-generation doesn't cause permanent
+    // capacity loss.
+    tokio::spawn(reconcile_seeded_slots(
+        scheduler,
+        http_client,
+        config.llama_server_url.clone(),
+    ));
+
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn reconcile_seeded_slots(
+    scheduler: aivyx_broker::Scheduler,
+    http_client: reqwest::Client,
+    llama_server_url: String,
+) {
+    let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+    // The first tick fires immediately; skip it since startup already
+    // seeded from a fresh `/slots` fetch moments ago.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        match aivyx_broker::llama_client::fetch_slots(&http_client, &llama_server_url).await {
+            Ok(slots) => {
+                for slot in slots {
+                    if !slot.is_processing {
+                        scheduler.reconcile_seeded_idle(slot.id);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "reconcile: failed to poll llama-server /slots, will retry next interval");
+            }
+        }
+    }
 }
