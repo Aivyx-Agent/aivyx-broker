@@ -24,7 +24,11 @@ read it in full before starting; this plan assumes it.
 
 - Loopback-only, no auth: binds `127.0.0.1` by default, same trust model as
   `llama-server` itself. Never add auth/remote-binding in this plan.
-- FIFO scheduling only in v1 — no priority/weighting. Do not add either.
+- No priority/weighted scheduling in v1 — do not add either. Admission is
+  approximately FIFO by arrival order — under contention, a released
+  slot's queued waiters race to reclaim it rather than being served in
+  strict order, so there's no hard ordering guarantee beyond each
+  request's own queue timeout.
 - The broker keeps no state that must outlive its own process. On startup
   it always rebuilds occupancy from `llama-server`'s real `GET /slots`.
   Never persist scheduler state to disk.

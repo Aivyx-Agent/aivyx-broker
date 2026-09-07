@@ -70,9 +70,10 @@ that).
   `{"prefix_hash": "...", "preferred_slot": <u32 or null>}`. Omit it for
   plain "any free slot" behavior.
 - `GET /status` — broker health + which `llama-server` it's proxying to.
-- `GET /slots` — the broker's own occupancy view (superset of
-  `llama-server`'s own `/slots`, adding cross-process attribution
-  `llama-server` has no notion of).
+- `GET /slots` — the broker's own occupancy view: `{slot_id, busy,
+  resident_prefix}` per slot — a superset of `llama-server`'s own
+  `/slots`, adding which `prefix_hash` is currently resident in each slot
+  (something `llama-server`'s own `/slots` doesn't expose).
 
 ## Honest tradeoffs
 
@@ -80,8 +81,11 @@ that).
   becomes as load-bearing as `llama-server` itself — if it's down, both
   client apps see connection-refused. This is an accepted cost of
   centralizing coordination, not a bug.
-- **No priority/weighted scheduling in v1.** Pure FIFO by arrival order.
-  Deferred as a future increment.
+- **No priority/weighted scheduling in v1.** Admission is approximately
+  FIFO by arrival order — under contention, a released slot's queued
+  waiters race to reclaim it rather than being served in strict order, so
+  there's no hard ordering guarantee beyond each request's own queue
+  timeout. Priority/weighting is deferred as a future increment.
 - **No real multi-process race test exists.** This project's own test
   suite has no way to run two genuine OS processes contending for one
   genuine `llama-server` — verified with fakes/mocks only. Manual

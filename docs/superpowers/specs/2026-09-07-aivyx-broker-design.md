@@ -44,9 +44,13 @@ whether the current failure mode is "only" a performance problem.
 
 ## Out of scope for v1
 
-- Priority/weighted scheduling across processes or requests. v1 is pure
-  FIFO by arrival order. Explicitly deferred as a future increment once
-  real usage shows starvation is worth solving.
+- Priority/weighted scheduling across processes or requests. v1 admits
+  approximately FIFO by arrival order — under contention, a released
+  slot's queued waiters race to reclaim it rather than being served in
+  strict order, so there's no hard ordering guarantee beyond each
+  request's own queue timeout. Priority/weighting is explicitly deferred
+  as a future increment once real usage shows starvation is worth
+  solving.
 - Remote/multi-host operation. The broker is a local-loopback-only process,
   same trust model as `llama-server` itself today — no auth, binds
   `127.0.0.1` only, not safe to expose beyond localhost.
@@ -180,16 +184,28 @@ label, prefix hash, busy/idle, queue position if contested) — a superset of
    usually still the faster outcome.
 3. No hint, or the hinted slot is unknown to the broker (never-seen
    prefix) → assign any free slot, LRU-first among idle ones.
-4. No slots free at all, no preference → FIFO queue, first-come-first-served.
-   No priority tiers in v1.
+4. No slots free at all, no preference → FIFO queue, approximately
+   first-come-first-served (see "Queue mechanics" below for why this isn't
+   a strict ordering guarantee). No priority tiers in v1.
 
 ## Scheduling & failure handling
 
 **Queue mechanics:** a queued request holds its HTTP connection open,
 awaiting admission (no new pattern — same shape as a client blocked on a
-permission-gate prompt). A slot release wakes the head of that slot's
-specific wait queue; a general "any free slot" release wakes the head of
-the global queue.
+permission-gate prompt). A slot release wakes every waiter queued for that
+slot's specific wait queue, and every waiter in the global "any free slot"
+queue too — not just the head of each. This is deliberate: stopping after
+the first successfully-woken waiter left a narrow starvation window (if
+that waiter's future was dropped without being re-polled before it could
+reclaim the slot, nobody else queued behind it would ever be woken even
+though the slot was sitting free). Every waiter re-validates by attempting
+admission again itself upon waking, so waking more than one is safe — only
+whichever one wins the race actually claims the slot; the rest re-queue and
+keep waiting. The tradeoff: admission is approximately FIFO by arrival
+order, not strictly ordered — under contention, a released slot's queued
+waiters race to reclaim it rather than being served in strict order, so
+there's no hard ordering guarantee beyond each request's own queue
+timeout.
 
 **Timeouts:** a request queued past a configurable ceiling (default 60s)
 gets a clear error back rather than hanging forever — the whole reason this

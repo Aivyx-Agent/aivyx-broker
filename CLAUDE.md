@@ -27,6 +27,7 @@ this design.
 cargo build
 cargo test
 cargo clippy --all-targets
+cargo fmt --check
 
 cargo run -- --llama-server-url http://127.0.0.1:8080 --kvcache-store-path ~/.local/state/aivyx-broker/kvcache
 ```
@@ -37,7 +38,10 @@ safe to expose beyond `127.0.0.1`.
 ## Known, deliberately-undefended limitations
 
 - Loopback-only, no auth. Not safe to expose beyond `127.0.0.1`.
-- No priority/weighted scheduling — pure FIFO in v1.
+- No priority/weighted scheduling in v1. Admission is approximately FIFO
+  by arrival order — under contention, a released slot's queued waiters
+  race to reclaim it rather than being served in strict order, so there's
+  no hard ordering guarantee beyond each request's own queue timeout.
 - No persisted broker state across restarts (by design — see the spec's
   "Broker startup/restart" section); a restart loses cross-process
   fairness bookkeeping but never desyncs from `llama-server`'s own
