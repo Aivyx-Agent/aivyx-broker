@@ -44,7 +44,11 @@ async fn chat_completions(
         .and_then(|o| o.remove("aivyx_slot_hint"))
         .and_then(|v| serde_json::from_value::<crate::SlotHint>(v).ok());
 
-    let admission = match state.scheduler.admit(hint.clone(), state.queue_timeout).await {
+    let admission = match state
+        .scheduler
+        .admit(hint.clone(), state.queue_timeout)
+        .await
+    {
         Ok(a) => a,
         Err(crate::SchedulerError::Timeout) => {
             return (
@@ -60,7 +64,10 @@ async fn chat_completions(
     // streamed response body below and outlive this `async fn`'s own
     // stack frame, which returns as soon as the `Body` is *constructed*,
     // well before it's actually drained to the client.
-    let guard = ReleaseGuard { scheduler: state.scheduler.clone(), slot_id: admission.slot_id };
+    let guard = ReleaseGuard {
+        scheduler: state.scheduler.clone(),
+        slot_id: admission.slot_id,
+    };
 
     let result = handle_admitted(&state, &mut body, &hint, admission, guard).await;
 
@@ -110,23 +117,29 @@ impl Drop for ReleaseGuard {
 /// disconnect). Preserves `inner`'s item type unchanged so it satisfies
 /// whatever bound `axum::body::Body::from_stream` needs, identically to
 /// passing `inner` directly.
-fn release_on_stream_end<S>(inner: S, guard: ReleaseGuard) -> impl futures::Stream<Item = S::Item> + Send + 'static
+fn release_on_stream_end<S>(
+    inner: S,
+    guard: ReleaseGuard,
+) -> impl futures::Stream<Item = S::Item> + Send + 'static
 where
     S: futures::Stream + Send + 'static,
 {
-    futures::stream::unfold((Box::pin(inner), Some(guard)), |(mut stream, mut guard)| async move {
-        use futures::StreamExt;
-        match stream.next().await {
-            Some(item) => Some((item, (stream, guard))),
-            None => {
-                // Stream exhausted: drop the guard now (releasing the
-                // slot) instead of waiting for the unfold combinator
-                // itself to be dropped later.
-                guard.take();
-                None
+    futures::stream::unfold(
+        (Box::pin(inner), Some(guard)),
+        |(mut stream, mut guard)| async move {
+            use futures::StreamExt;
+            match stream.next().await {
+                Some(item) => Some((item, (stream, guard))),
+                None => {
+                    // Stream exhausted: drop the guard now (releasing the
+                    // slot) instead of waiting for the unfold combinator
+                    // itself to be dropped later.
+                    guard.take();
+                    None
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 async fn handle_admitted(
@@ -136,10 +149,20 @@ async fn handle_admitted(
     admission: crate::Admission,
     guard: ReleaseGuard,
 ) -> Result<axum::response::Response, anyhow::Error> {
-    if !admission.cache_ready
-        && let Some(h) = hint
-    {
-        warm_or_restore(state, body, h, admission.slot_id).await?;
+    match hint {
+        Some(h) if !admission.cache_ready => {
+            warm_or_restore(state, body, h, admission.slot_id).await?;
+        }
+        None => {
+            // A hint-less request still gets forwarded onto whatever slot
+            // admission picked, silently overwriting that slot's real KV
+            // content -- clear the occupancy table's record of what used
+            // to be resident there so a later request for that stale
+            // prefix doesn't wrongly see `cache_ready: true` and skip
+            // restoring content that's actually gone (Fix 7).
+            state.scheduler.clear_resident(admission.slot_id);
+        }
+        Some(_) => {}
     }
 
     if let Some(obj) = body.as_object_mut() {
@@ -148,7 +171,10 @@ async fn handle_admitted(
 
     let resp = state
         .http
-        .post(format!("{}/v1/chat/completions", state.llama_server_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/v1/chat/completions",
+            state.llama_server_url.trim_end_matches('/')
+        ))
         .json(body)
         .send()
         .await?;
@@ -177,7 +203,8 @@ async fn handle_admitted(
     for (name, value) in headers.iter() {
         builder = builder.header(name, value);
     }
-    let axum_body = axum::body::Body::from_stream(release_on_stream_end(resp.bytes_stream(), guard));
+    let axum_body =
+        axum::body::Body::from_stream(release_on_stream_end(resp.bytes_stream(), guard));
     Ok(builder.body(axum_body)?)
 }
 
@@ -194,16 +221,23 @@ async fn warm_or_restore(
         prefix_hash: hint.prefix_hash.clone(),
     };
 
-    let restored = state.kv_store.restore_into_slot(&key, slot_id).await.unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "kvcache: restore_into_slot failed");
-        false
-    });
+    let restored = state
+        .kv_store
+        .restore_into_slot(&key, slot_id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "kvcache: restore_into_slot failed");
+            false
+        });
 
     if !restored {
         let system_message = body
             .get("messages")
             .and_then(|m| m.as_array())
-            .and_then(|arr| arr.iter().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")))
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            })
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"role": "system", "content": ""}));
         let tools = body.get("tools").cloned();
@@ -223,7 +257,10 @@ async fn warm_or_restore(
         }
         state
             .http
-            .post(format!("{}/v1/chat/completions", state.llama_server_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/v1/chat/completions",
+                state.llama_server_url.trim_end_matches('/')
+            ))
             .json(&warm_up)
             .send()
             .await?
@@ -231,14 +268,23 @@ async fn warm_or_restore(
 
         if let Err(err) = state
             .kv_store
-            .save_from_slot(&key, slot_id, aivyx_kvcache::CacheMeta { size_bytes: 1, token_count: 1 })
+            .save_from_slot(
+                &key,
+                slot_id,
+                aivyx_kvcache::CacheMeta {
+                    size_bytes: 1,
+                    token_count: 1,
+                },
+            )
             .await
         {
             tracing::warn!(error = %err, "kvcache: save_from_slot failed");
         }
     }
 
-    state.scheduler.mark_resident(slot_id, hint.prefix_hash.clone());
+    state
+        .scheduler
+        .mark_resident(slot_id, hint.prefix_hash.clone());
     Ok(())
 }
 
@@ -274,7 +320,12 @@ mod tests {
         let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
         let app = build_router(state);
         let response = app
-            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -285,11 +336,18 @@ mod tests {
         let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
         let app = build_router(state);
         let response = app
-            .oneshot(Request::builder().uri("/slots").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/slots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 2);
     }
@@ -336,7 +394,11 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         // Warm-up + real forward = at least 2 calls to llama-server.
-        assert!(requests.len() >= 2, "expected warm-up + forward, got {}", requests.len());
+        assert!(
+            requests.len() >= 2,
+            "expected warm-up + forward, got {}",
+            requests.len()
+        );
     }
 
     #[tokio::test]
@@ -350,9 +412,7 @@ mod tests {
         });
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(429).set_body_json(upstream_error_body.clone()),
-            )
+            .respond_with(ResponseTemplate::new(429).set_body_json(upstream_error_body.clone()))
             .mount(&server)
             .await;
 
@@ -378,7 +438,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, upstream_error_body);
     }
@@ -424,7 +486,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get("x-llama-server-marker").map(|v| v.to_str().unwrap()),
+            response
+                .headers()
+                .get("x-llama-server-marker")
+                .map(|v| v.to_str().unwrap()),
             Some("from-upstream"),
         );
     }
@@ -507,7 +572,11 @@ mod tests {
         state.queue_timeout = Duration::from_millis(50);
         // Occupy the only slot directly via the scheduler, bypassing HTTP,
         // so the next request has nothing free to admit to.
-        let _held = state.scheduler.admit(None, Duration::from_secs(1)).await.unwrap();
+        let _held = state
+            .scheduler
+            .admit(None, Duration::from_secs(1))
+            .await
+            .unwrap();
 
         let app = build_router(state);
         let req_body = serde_json::json!({"messages": []});
@@ -523,5 +592,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn hint_less_admission_clears_stale_resident_prefix_on_the_slot_it_lands_on() {
+        // Regression for Fix 7: a hint-less request still gets forwarded
+        // onto whatever slot admission picked, silently overwriting that
+        // slot's real KV content -- the occupancy table must stop naming
+        // the old prefix, or a later request for it wrongly sees
+        // `cache_ready: true` and skips restoring content that's gone.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"delta": {"content": ""}, "finish_reason": "length"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let (mut state, _dir) = test_state(server.uri()).await;
+        state.llama_server_url = server.uri();
+        // A single slot forces the hint-less second request to land on
+        // exactly the slot the first (hinted) request marked resident.
+        state.scheduler = Scheduler::new(1);
+        let app = build_router(state.clone());
+
+        // First request: has a hint, so `warm_or_restore` marks the slot
+        // resident with "abc123".
+        let hinted_body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "hi"}
+            ],
+            "aivyx_slot_hint": {"prefix_hash": "abc123", "preferred_slot": null}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(hinted_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Drain the streamed body so the `ReleaseGuard` drops and frees
+        // the slot for the next request.
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let snap = state.scheduler.snapshot();
+        assert_eq!(snap[0].resident_prefix.as_deref(), Some("abc123"));
+
+        // Second request: no hint at all -- lands on the same (only)
+        // slot, forwarding onto it and overwriting its real content.
+        let hint_less_body =
+            serde_json::json!({"messages": [{"role": "user", "content": "hi again"}]});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(hint_less_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let snap = state.scheduler.snapshot();
+        assert_eq!(
+            snap[0].resident_prefix, None,
+            "stale resident prefix must be cleared once a hint-less request overwrites the slot"
+        );
     }
 }
