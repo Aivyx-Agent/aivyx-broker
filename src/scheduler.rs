@@ -156,21 +156,25 @@ impl Scheduler {
 
         // Wake this slot's specific waiters first (rule: don't let a
         // global waiter steal a slot someone is specifically waiting on).
-        if let Some(queue) = inner.slot_waiters.get_mut(&slot_id)
-            && let Some(tx) = queue.pop_front() {
-                inner.slots[slot_id as usize].busy = true;
-                if tx.send(slot_id).is_err() {
-                    // Waiter timed out, slot is no longer reserved
-                    inner.slots[slot_id as usize].busy = false;
+        // Loop through slot-specific waiters until one successfully receives,
+        // skipping any that have already timed out.
+        if let Some(queue) = inner.slot_waiters.get_mut(&slot_id) {
+            while let Some(tx) = queue.pop_front() {
+                if tx.send(slot_id).is_ok() {
+                    inner.slots[slot_id as usize].busy = true;
+                    return;
                 }
+                // This waiter timed out; continue to the next one.
+            }
+        }
+
+        // No slot-specific waiter accepted; try global waiters.
+        while let Some(tx) = inner.global_waiters.pop_front() {
+            if tx.send(slot_id).is_ok() {
+                inner.slots[slot_id as usize].busy = true;
                 return;
             }
-        if let Some(tx) = inner.global_waiters.pop_front() {
-            inner.slots[slot_id as usize].busy = true;
-            if tx.send(slot_id).is_err() {
-                // Waiter timed out, slot is no longer reserved
-                inner.slots[slot_id as usize].busy = false;
-            }
+            // This waiter timed out; continue to the next one.
         }
     }
 }
@@ -242,5 +246,62 @@ mod tests {
         sched.release(0);
         let admission = sched.admit(None, Duration::from_secs(1)).await.unwrap();
         assert_eq!(admission.slot_id, 0);
+    }
+
+    #[tokio::test]
+    async fn release_retries_timed_out_waiters_preserving_fifo_for_slot() {
+        // Regression test for: release() must retry queue on failed send,
+        // not strand waiters.
+        //
+        // When a waiter for a specific slot times out and drops its receiver
+        // before release() tries to send, the previous code would return
+        // immediately instead of trying the next waiter in that slot's queue.
+        // This test ensures the fix tries all queued waiters in order.
+        let sched = Scheduler::new(1);
+        let hint = Some(SlotHint {
+            prefix_hash: "test".to_string(),
+            preferred_slot: Some(0),
+        });
+
+        // Admit the slot to make it busy.
+        let _held = sched.admit(hint.clone(), Duration::from_secs(1)).await.unwrap();
+
+        // Queue first waiter with a very short timeout so it will expire
+        // before we call release().
+        let sched_first = sched.clone();
+        let first_waiter = tokio::spawn(async move {
+            sched_first.admit(hint.clone(), Duration::from_millis(100)).await
+        });
+
+        // Give the first waiter time to queue.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Queue second waiter with a long timeout - this one should be
+        // admitted when we release().
+        let sched_second = sched.clone();
+        let hint2 = Some(SlotHint {
+            prefix_hash: "test".to_string(),
+            preferred_slot: Some(0),
+        });
+        let second_waiter = tokio::spawn(async move {
+            sched_second.admit(hint2, Duration::from_secs(5)).await
+        });
+
+        // Give the second waiter time to queue (after the first).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Wait for the first waiter to time out.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let first_result = first_waiter.await.unwrap();
+        assert!(matches!(first_result, Err(SchedulerError::Timeout)));
+
+        // Now release the slot. This should try the first waiter's oneshot
+        // (which will fail because it timed out), then try the second waiter's
+        // (which should succeed).
+        sched.release(0);
+
+        // The second waiter should be admitted.
+        let second_result = second_waiter.await.unwrap().unwrap();
+        assert_eq!(second_result.slot_id, 0);
     }
 }
