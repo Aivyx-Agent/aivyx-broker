@@ -53,8 +53,9 @@ whether the current failure mode is "only" a performance problem.
 - Persisting broker-owned scheduling state across restarts. `llama-server`'s
   own `GET /slots` remains the source of truth for physical occupancy on
   broker startup; `aivyx-kvcache`'s existing WAL-sqlite manifest remains
-  the source of truth for saved KV content on disk. The broker adds only
-  the missing piece — live arbitration of who uses a slot right now — and
+  the source of truth for saved KV content on disk (the broker drives it
+  as a library dependency, same as each client does today — it doesn't
+  reimplement persistence). The broker's own occupancy/queue bookkeeping
   keeps no state that must outlive its own process.
 - Automatic broker lifecycle management (auto-spawn, systemd unit
   generation) by either client app. The broker is started the same way
@@ -97,9 +98,35 @@ Components inside `aivyx-broker`:
   state}`) plus a FIFO wait queue per contested slot and one global FIFO
   queue for "any free slot" requests. Rebuilt from `llama-server`'s real
   `GET /slots` on every broker startup.
-- A thin proxy/forwarder to the real `llama-server`, streaming chunks
-  through as they arrive rather than buffering the full response (same
-  shape as the mpsc-forwarding shim built for the mistral.rs work).
+- A thin proxy/forwarder to the real `llama-server`. `reqwest::Response`'s
+  own `bytes_stream()` is already an owned, `'static` stream (unlike
+  mistral.rs's in-process, borrowed `Stream<'_>`), so this is a direct
+  stream-through, not another mpsc-forwarding shim — chunks pass to the
+  client as they arrive, never buffered whole.
+- **The broker owns the full KV-cache restore/warm/save lifecycle, not
+  just live slot admission** — a late but important correction made
+  during implementation planning. The original per-app flow
+  (`ensure_kv_slot_checked_out`) does two things together: pick a slot
+  number, then restore/warm/save that slot's on-disk content via
+  `aivyx-kvcache`'s `LlamaServerSlotStore` — and it only learns which slot
+  to restore into *after* picking one. Once admission moves inside the
+  broker's single `/v1/chat/completions` call, the client can no longer
+  do its own restore first — it doesn't know the slot number yet. So
+  `aivyx-broker` depends on `aivyx-kvcache` directly and drives
+  `restore_into_slot`/`save_from_slot` itself, using each client's
+  `prefix_hash` hint as the `CacheKey`. Concretely, on each request: if
+  the hint's `prefix_hash` is already the *current* occupant of some slot
+  in the broker's own occupancy table (i.e. the same session's own prior
+  turn, still resident), admit straight to that slot — no restore/save
+  needed, since the slot's live content already matches and llama-server
+  itself accumulates the growing turn history in place. Otherwise
+  (first request for this `prefix_hash`, or the broker just restarted and
+  lost its occupancy memory) — admit a slot per the rules below, call
+  `restore_into_slot` before forwarding the request, and call
+  `save_from_slot` after the response completes so a future session
+  (this client's, or another's, restarted or not) can reuse it. This
+  fully replaces `ensure_kv_slot_checked_out` on the broker path — clients
+  using the broker never call `aivyx-kvcache` themselves.
 
 ## Protocol
 
@@ -197,14 +224,22 @@ Additive and config-gated in both apps — a new backend mode (e.g.
 so setups that don't need multi-process sharing see zero behavior change.
 When enabled:
 
-- `aivyx`'s `llm_planner.rs` and `aivyx-coder`'s `agent/mod.rs` stop calling
-  their local `KvSlotPool::checkout()` (or equivalent) entirely on this
-  path — they no longer pick a physical slot number themselves. They reuse
-  the `prefix_hash` they already compute today for `CacheKey` (via each
-  app's own existing `compute_prefix_hash`) as the hint's `prefix_hash`,
-  and let the broker decide the slot. This is a net simplification: today's
-  client-local slot-picking logic becomes dead code on the broker path,
-  replaced by "ask the broker."
+- `aivyx`'s `llm_planner.rs` and `aivyx-coder`'s `agent/mod.rs` skip
+  `ensure_kv_slot_checked_out` (or equivalent) entirely on this path — no
+  local `KvSlotPool::checkout()`, no `aivyx-kvcache` calls at all. They
+  reuse the `prefix_hash` they already compute today for `CacheKey` (via
+  each app's own existing `compute_prefix_hash`) as the hint's
+  `prefix_hash`, attach it to the outgoing `ChatRequest`, and let the
+  broker own slot assignment *and* restore/warm/save. This is a net
+  simplification: today's client-local slot-picking-and-persistence logic
+  becomes entirely dead code on the broker path, replaced by "ask the
+  broker."
+- Each client's own `kvcache_store_path`/`kvcache_max_bytes`-style config
+  becomes irrelevant on the broker path — the broker takes its own
+  `--kvcache-store-path`/`--kvcache-max-bytes` at startup and owns that
+  store directly. Both apps should point their own `kvcache_store_path` at
+  the same directory as the broker's, matching the multi-process sharing
+  convention the kvcache-store-path-sharing work already established.
 - The existing direct-to-`llama-server` mode (today's default) is
   unchanged — this is a new opt-in path, not a replacement.
 
