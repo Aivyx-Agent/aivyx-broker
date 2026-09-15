@@ -59,12 +59,16 @@ error against its `base_url`, the same shape as `llama-server` being down.
 
 ## Pointing a client at the broker
 
-Both `aivyx` and `aivyx-coder` need a broker-aware backend mode to use
-this — see each repo's own README for its own config once that work
-lands. In short: point the client's `base_url` at the broker instead of
-`llama-server` directly, and enable its broker mode so it stops doing its
-own local slot-picking and kvcache restore/save (the broker now owns
-that).
+Both `aivyx-pa` and `aivyx-coder` have shipped a broker-aware backend
+mode — see [`aivyx-pa`'s own
+INSTALL.md](https://github.com/Aivyx-Agent/aivyx-pa/blob/main/docs/INSTALL.md#coordinating-gpu-slot-access-across-multiple-processes-aivyx-broker)
+(`aivyx-pa`'s top-level README/CLAUDE.md don't mention it yet, so this is
+the real place to look) and [`aivyx-coder`'s own
+README](https://github.com/Aivyx-Agent/aivyx-coder#multi-process-gpu-sharing-aivyx-broker)
+for each one's own config. In short: point the client's `base_url` at the
+broker instead of `llama-server` directly, and enable its broker mode so
+it stops doing its own local slot-picking and kvcache restore/save (the
+broker now owns that).
 
 ## API
 
