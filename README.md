@@ -56,6 +56,8 @@ error against its `base_url`, the same shape as `llama-server` being down.
 | `--kvcache-store-path` | `AIVYX_BROKER_KVCACHE_STORE_PATH` | *(required)* | Shared kvcache store directory — point both `aivyx` and `aivyx-coder`'s own `kvcache_store_path` at the same directory |
 | `--kvcache-max-bytes` | `AIVYX_BROKER_KVCACHE_MAX_BYTES` | 10 GiB | LRU eviction budget for the kvcache store |
 | `--queue-timeout-secs` | `AIVYX_BROKER_QUEUE_TIMEOUT_SECS` | `60` | How long a request may wait for a free slot before getting a clear `503` instead of hanging |
+| `--gpu-lock-queue-timeout-secs` | `AIVYX_BROKER_GPU_LOCK_QUEUE_TIMEOUT_SECS` | `300` | How long a caller may wait in the GPU-lock queue (see [`POST /gpu-lock/acquire`](#api) below) before getting a clear `503` instead of hanging — longer than `queue-timeout-secs` because a GPU generation job can legitimately queue much longer than a chat turn |
+| `--gpu-lock-max-hold-secs` | `AIVYX_BROKER_GPU_LOCK_MAX_HOLD_SECS` | `900` | Safety valve: a GPU lock lease held longer than this is force-released by a background reap task, on the assumption its holder crashed or disconnected without releasing |
 
 ## Pointing a client at the broker
 
@@ -81,6 +83,18 @@ broker now owns that).
   resident_prefix}` per slot — a superset of `llama-server`'s own
   `/slots`, adding which `prefix_hash` is currently resident in each slot
   (something `llama-server`'s own `/slots` doesn't expose).
+- `POST /gpu-lock/acquire` — a generic, lease-based exclusive lock for
+  GPU-heavy non-LLM generation work (Aivyx-Vision's mold backend),
+  deliberately independent of the `/v1/chat/completions` slot-scheduling
+  path above (see `src/gpu_lock.rs`'s own doc comment for why). Waits for
+  exclusive access up to `--gpu-lock-queue-timeout-secs`, then returns
+  `200 {"lease_id": "<uuid>"}` or `503` on timeout.
+- `POST /gpu-lock/release` — releases a lease acquired above:
+  `{"lease_id": "<uuid>"}` → `200` on success, `404` if the lease is
+  unknown/already released/expired, `400` if `lease_id` isn't a valid
+  UUID. A lease not released within `--gpu-lock-max-hold-secs` is force-
+  released by a background reap task, so a crashed holder can't wedge the
+  lock forever.
 
 ## Honest tradeoffs
 

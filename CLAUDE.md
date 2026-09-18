@@ -21,6 +21,11 @@ client-side race and llama-server's own server-side defer-on-busy-slot
 behavior, confirmed against llama.cpp's `server-context.cpp`) that shaped
 this design.
 
+As of 2026-09-18 the broker also arbitrates GPU-heavy non-LLM workloads
+(Aivyx-Vision's mold backend) via a separate, independent lease-based
+lock (`POST /gpu-lock/acquire` / `/gpu-lock/release`) — see
+`src/gpu_lock.rs`'s own doc comment for the full rationale.
+
 ## Build, run, test, lint
 
 ```sh

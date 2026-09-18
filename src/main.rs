@@ -52,19 +52,15 @@ async fn main() -> anyhow::Result<()> {
         config.llama_server_url.clone(),
         config.kvcache_max_bytes,
     )?;
+    let gpu_lock = aivyx_broker::GpuLock::new(Duration::from_secs(config.gpu_lock_max_hold_secs));
     let state = aivyx_broker::server::AppState {
         scheduler: scheduler.clone(),
         http: http_client.clone(),
         llama_server_url: config.llama_server_url.clone(),
         kv_store: std::sync::Arc::new(kv_store),
         queue_timeout: std::time::Duration::from_secs(config.queue_timeout_secs),
-        // Placeholder construction, just enough to keep this binary
-        // compiling now that `AppState` has these two fields (Task 2's own
-        // scope, src/server.rs). Real CLI/env config for these (mirroring
-        // `queue_timeout_secs`'s pattern in config.rs) and the periodic
-        // `reap_expired()` background task are Task 3's job, not this one's.
-        gpu_lock: aivyx_broker::GpuLock::new(std::time::Duration::from_secs(600)),
-        gpu_lock_queue_timeout: std::time::Duration::from_secs(config.queue_timeout_secs),
+        gpu_lock: gpu_lock.clone(),
+        gpu_lock_queue_timeout: Duration::from_secs(config.gpu_lock_queue_timeout_secs),
     };
     let app = aivyx_broker::server::build_router(state);
 
@@ -84,6 +80,13 @@ async fn main() -> anyhow::Result<()> {
         http_client,
         config.llama_server_url.clone(),
     ));
+
+    // Background reap: a GPU-lock holder that crashes or disconnects
+    // between its acquire and release calls has no `ReleaseGuard` (unlike
+    // the chat-completions path) to release it automatically, so the lock
+    // would otherwise stay held forever. Poll periodically and force-
+    // release any lease that's exceeded its `max_hold` safety expiry.
+    tokio::spawn(reap_expired_gpu_lock(gpu_lock));
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -112,5 +115,22 @@ async fn reconcile_seeded_slots(
                 tracing::warn!(error = %err, "reconcile: failed to poll llama-server /slots, will retry next interval");
             }
         }
+    }
+}
+
+/// Periodically force-releases a GPU lock lease that's exceeded its
+/// max_hold safety expiry -- see `GpuLock::reap_expired`'s own doc
+/// comment for why this exists (a crashed client between its acquire
+/// and release calls has no Drop guard to release it automatically,
+/// unlike the chat-completions path's ReleaseGuard). Reuses
+/// `RECONCILE_INTERVAL`: it's already short (10s) relative to any
+/// reasonable `max_hold` (900s by default), so a dedicated interval
+/// would add a second tunable without meaningfully improving reap
+/// promptness.
+async fn reap_expired_gpu_lock(gpu_lock: aivyx_broker::gpu_lock::GpuLock) {
+    let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+    loop {
+        interval.tick().await;
+        gpu_lock.reap_expired();
     }
 }

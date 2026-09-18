@@ -31,6 +31,30 @@ pub struct BrokerConfig {
     /// a clear timeout error instead of hanging.
     #[arg(long, env = "AIVYX_BROKER_QUEUE_TIMEOUT_SECS", default_value_t = 60)]
     pub queue_timeout_secs: u64,
+
+    /// How long a caller may wait in the GPU-lock queue before getting a
+    /// clear timeout error instead of hanging. Distinct from
+    /// `queue_timeout_secs` (the LLM chat-completion admission queue) --
+    /// a GPU generation job can legitimately queue much longer than a
+    /// chat turn.
+    #[arg(
+        long,
+        env = "AIVYX_BROKER_GPU_LOCK_QUEUE_TIMEOUT_SECS",
+        default_value_t = 300
+    )]
+    pub gpu_lock_queue_timeout_secs: u64,
+
+    /// Safety valve: a GPU lock lease held longer than this is force-
+    /// released by the background reap task, on the assumption its
+    /// holder crashed or disconnected without releasing. Set generously
+    /// above realistic generation time (an image/3D generation job can
+    /// legitimately run for minutes).
+    #[arg(
+        long,
+        env = "AIVYX_BROKER_GPU_LOCK_MAX_HOLD_SECS",
+        default_value_t = 900
+    )]
+    pub gpu_lock_max_hold_secs: u64,
 }
 
 #[cfg(test)]
@@ -51,6 +75,8 @@ mod tests {
         assert_eq!(cfg.kvcache_store_path, PathBuf::from("/tmp/kv"));
         assert_eq!(cfg.kvcache_max_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(cfg.queue_timeout_secs, 60);
+        assert_eq!(cfg.gpu_lock_queue_timeout_secs, 300);
+        assert_eq!(cfg.gpu_lock_max_hold_secs, 900);
     }
 
     #[test]
