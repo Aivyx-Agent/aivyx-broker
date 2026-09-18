@@ -28,6 +28,11 @@ impl LeaseId {
     fn new() -> Self {
         LeaseId(uuid::Uuid::new_v4())
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
 }
 
 impl std::fmt::Display for LeaseId {
@@ -130,10 +135,14 @@ impl GpuLock {
             .as_ref()
             .is_some_and(|h| h.acquired_at.elapsed() > self.max_hold);
         if expired {
-            tracing::warn!(
-                "gpu-lock: force-releasing a lease that exceeded max_hold -- \
-                 the holder likely crashed or disconnected without releasing"
-            );
+            if let Some(h) = inner.held.as_ref() {
+                tracing::warn!(
+                    lease = %h.lease,
+                    held_for_secs = h.acquired_at.elapsed().as_secs(),
+                    "gpu-lock: force-releasing a lease that exceeded max_hold -- \
+                     the holder likely crashed or disconnected without releasing"
+                );
+            }
             inner.held = None;
             Self::wake_all(&mut inner);
         }
@@ -150,7 +159,6 @@ impl GpuLock {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn is_held(&self) -> bool {
         self.inner.lock().unwrap().held.is_some()
     }
@@ -206,6 +214,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_rejects_a_lease_that_does_not_match_the_current_holder() {
+        let lock = GpuLock::new(Duration::from_secs(60));
+        let real_holder = lock.acquire(Duration::from_secs(1)).await.unwrap();
+
+        // A foreign/stale lease id -- not the one the current holder was
+        // actually issued -- must not be able to release the real holder's
+        // lock. This is the single defining property of a lease-based lock:
+        // proven here by mutation (temporarily loosening release()'s guard
+        // to `Some(_h) => ...` made this test the only one of the whole
+        // suite to fail, confirming it's load-bearing for this property).
+        let foreign_lease = LeaseId::new_for_test();
+        let result = lock.release(foreign_lease);
+        assert!(matches!(result, Err(GpuLockError::UnknownLease)));
+
+        // The real holder's lease must still be valid -- releasing it must
+        // still succeed, proving the foreign release attempt didn't corrupt
+        // state or silently free the real holder's slot.
+        lock.release(real_holder).unwrap();
+    }
+
+    #[tokio::test]
     async fn release_wakes_every_queued_waiter_not_just_the_first() {
         // Same regression shape as Scheduler's own
         // `release_wakes_a_second_waiter_even_if_the_first_woken_one_is_dropped_unpolled`
@@ -237,6 +266,7 @@ mod tests {
             .unwrap()
             .unwrap();
         lock.release(admitted).unwrap();
+        assert!(!lock.is_held(), "lock must be free after the final release");
     }
 
     #[tokio::test]
@@ -255,7 +285,7 @@ mod tests {
         )
         .await;
         assert!(
-            result.is_ok(),
+            result.unwrap().is_ok(),
             "lock should be free after reap_expired force-released the stale lease"
         );
     }
