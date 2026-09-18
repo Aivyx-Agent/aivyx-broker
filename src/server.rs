@@ -17,6 +17,8 @@ pub struct AppState {
     pub llama_server_url: String,
     pub kv_store: Arc<aivyx_kvcache::LlamaServerSlotStore>,
     pub queue_timeout: Duration,
+    pub gpu_lock: crate::gpu_lock::GpuLock,
+    pub gpu_lock_queue_timeout: Duration,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -24,6 +26,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/status", get(status))
         .route("/slots", get(slots))
+        .route("/gpu-lock/acquire", post(gpu_lock_acquire))
+        .route("/gpu-lock/release", post(gpu_lock_release))
         .with_state(state)
 }
 
@@ -33,6 +37,56 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn slots(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!(state.scheduler.snapshot()))
+}
+
+async fn gpu_lock_acquire(State(state): State<AppState>) -> axum::response::Response {
+    match state.gpu_lock.acquire(state.gpu_lock_queue_timeout).await {
+        Ok(lease) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "lease_id": lease.to_string() })),
+        )
+            .into_response(),
+        Err(crate::gpu_lock::GpuLockError::Timeout) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "timed out waiting for the GPU lock"})),
+        )
+            .into_response(),
+        Err(crate::gpu_lock::GpuLockError::UnknownLease) => unreachable!(
+            "acquire() never returns UnknownLease -- only release()/reap_expired() paths do"
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ReleaseRequest {
+    lease_id: String,
+}
+
+async fn gpu_lock_release(
+    State(state): State<AppState>,
+    Json(body): Json<ReleaseRequest>,
+) -> axum::response::Response {
+    let lease_id = match body.lease_id.parse::<uuid::Uuid>() {
+        Ok(uuid) => crate::gpu_lock::LeaseId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "lease_id is not a valid UUID"})),
+            )
+                .into_response();
+        }
+    };
+    match state.gpu_lock.release(lease_id) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(crate::gpu_lock::GpuLockError::UnknownLease) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "lease not found, already released, or expired"})),
+        )
+            .into_response(),
+        Err(crate::gpu_lock::GpuLockError::Timeout) => {
+            unreachable!("release() never returns Timeout -- only acquire() does")
+        }
+    }
 }
 
 async fn chat_completions(
@@ -311,6 +365,8 @@ mod tests {
             llama_server_url,
             kv_store: Arc::new(kv_store),
             queue_timeout: Duration::from_secs(5),
+            gpu_lock: crate::gpu_lock::GpuLock::new(Duration::from_secs(600)),
+            gpu_lock_queue_timeout: Duration::from_secs(5),
         };
         (state, dir)
     }
@@ -673,5 +729,117 @@ mod tests {
             snap[0].resident_prefix, None,
             "stale resident prefix must be cleared once a hint-less request overwrites the slot"
         );
+    }
+
+    #[tokio::test]
+    async fn gpu_lock_acquire_then_release_round_trips_over_http() {
+        let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let app = build_router(state);
+
+        let acquire_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/gpu-lock/acquire")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acquire_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(acquire_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let lease_id = json["lease_id"]
+            .as_str()
+            .expect("lease_id must be present")
+            .to_string();
+
+        let release_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/gpu-lock/release")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"lease_id": lease_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(release_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gpu_lock_acquire_times_out_with_503_when_already_held() {
+        let (mut state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        state.gpu_lock_queue_timeout = Duration::from_millis(50);
+        let app = build_router(state.clone());
+
+        // Hold the lock directly via the GpuLock, bypassing HTTP, so the next
+        // HTTP acquire has nothing free.
+        let _held = state
+            .gpu_lock
+            .acquire(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/gpu-lock/acquire")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn gpu_lock_release_with_an_unknown_lease_id_is_a_clear_error_not_a_panic() {
+        let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/gpu-lock/release")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"lease_id": uuid::Uuid::new_v4().to_string()})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn gpu_lock_release_with_a_malformed_lease_id_is_a_clear_400_not_a_panic() {
+        let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/gpu-lock/release")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"lease_id": "not-a-uuid"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

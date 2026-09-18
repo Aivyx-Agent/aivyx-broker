@@ -58,6 +58,13 @@ async fn main() -> anyhow::Result<()> {
         llama_server_url: config.llama_server_url.clone(),
         kv_store: std::sync::Arc::new(kv_store),
         queue_timeout: std::time::Duration::from_secs(config.queue_timeout_secs),
+        // Placeholder construction, just enough to keep this binary
+        // compiling now that `AppState` has these two fields (Task 2's own
+        // scope, src/server.rs). Real CLI/env config for these (mirroring
+        // `queue_timeout_secs`'s pattern in config.rs) and the periodic
+        // `reap_expired()` background task are Task 3's job, not this one's.
+        gpu_lock: aivyx_broker::GpuLock::new(std::time::Duration::from_secs(600)),
+        gpu_lock_queue_timeout: std::time::Duration::from_secs(config.queue_timeout_secs),
     };
     let app = aivyx_broker::server::build_router(state);
 

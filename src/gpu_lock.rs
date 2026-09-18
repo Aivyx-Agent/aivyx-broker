@@ -41,6 +41,17 @@ impl std::fmt::Display for LeaseId {
     }
 }
 
+/// Wraps an already-parsed UUID as a `LeaseId` -- needed by callers (e.g.
+/// `server.rs`'s `POST /gpu-lock/release` handler) that must reconstruct a
+/// `LeaseId` from an inbound string id, since `LeaseId`'s tuple field is
+/// private and `new()` is deliberately not `pub` (only this crate's own
+/// `acquire()` should ever mint a *fresh* lease id).
+impl From<uuid::Uuid> for LeaseId {
+    fn from(uuid: uuid::Uuid) -> Self {
+        LeaseId(uuid)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GpuLockError {
     #[error("timed out waiting for the GPU lock")]
