@@ -48,7 +48,12 @@ pub struct BrokerConfig {
     /// released by the background reap task, on the assumption its
     /// holder crashed or disconnected without releasing. Set generously
     /// above realistic generation time (an image/3D generation job can
-    /// legitimately run for minutes).
+    /// legitimately run for minutes). This is a genuine tradeoff, not a
+    /// free safety net: if it fires while the holder is still alive and
+    /// running (just slow), the freed lock is handed to a second waiter
+    /// while the first is still using the GPU -- the exact double-
+    /// occupancy this lock exists to prevent. Set it above your worst-case
+    /// generation time, not merely the typical one.
     #[arg(
         long,
         env = "AIVYX_BROKER_GPU_LOCK_MAX_HOLD_SECS",

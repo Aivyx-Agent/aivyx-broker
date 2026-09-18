@@ -57,7 +57,7 @@ error against its `base_url`, the same shape as `llama-server` being down.
 | `--kvcache-max-bytes` | `AIVYX_BROKER_KVCACHE_MAX_BYTES` | 10 GiB | LRU eviction budget for the kvcache store |
 | `--queue-timeout-secs` | `AIVYX_BROKER_QUEUE_TIMEOUT_SECS` | `60` | How long a request may wait for a free slot before getting a clear `503` instead of hanging |
 | `--gpu-lock-queue-timeout-secs` | `AIVYX_BROKER_GPU_LOCK_QUEUE_TIMEOUT_SECS` | `300` | How long a caller may wait in the GPU-lock queue (see [`POST /gpu-lock/acquire`](#api) below) before getting a clear `503` instead of hanging — longer than `queue-timeout-secs` because a GPU generation job can legitimately queue much longer than a chat turn |
-| `--gpu-lock-max-hold-secs` | `AIVYX_BROKER_GPU_LOCK_MAX_HOLD_SECS` | `900` | Safety valve: a GPU lock lease held longer than this is force-released by a background reap task, on the assumption its holder crashed or disconnected without releasing |
+| `--gpu-lock-max-hold-secs` | `AIVYX_BROKER_GPU_LOCK_MAX_HOLD_SECS` | `900` | Safety valve: a GPU lock lease held longer than this is force-released by a background reap task, on the assumption its holder crashed or disconnected without releasing. If it fires on a holder that's still alive and running (just slow), the lock is handed to a second waiter while the first is still using the GPU -- set it above your worst-case generation time, not merely the typical one |
 
 ## Pointing a client at the broker
 
@@ -112,3 +112,16 @@ broker now owns that).
   genuine `llama-server` — verified with fakes/mocks only. Manual
   verification against a real rig is a documented follow-up, not a merge
   blocker.
+- **The GPU lock is advisory, not enforced against `/v1/chat/completions`.**
+  Holding a `gpu-lock` lease does not pause, throttle, or otherwise affect
+  LLM slot scheduling in any way — the two paths are deliberately
+  independent implementations (see `src/gpu_lock.rs`'s doc comment) with
+  no shared state. A client that acquires the GPU lock expecting LLM
+  inference to also be quiet during that window will be wrong; the lock
+  only excludes other GPU-lock callers from each other.
+- **No fairness guarantee among GPU-lock waiters**, same as the slot path
+  above — released/reaped lock waiters race to reclaim it rather than
+  being served in strict arrival order.
+- **A crashed GPU-lock holder wedges the lock for up to
+  `--gpu-lock-max-hold-secs`** before the background reap task frees it;
+  there's no faster way to detect the crash from the broker's side.

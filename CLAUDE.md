@@ -53,6 +53,14 @@ safe to expose beyond `127.0.0.1`.
   physical reality.
 - No automatic lifecycle management (auto-spawn, systemd unit
   generation) — started manually, same as `llama-server` itself.
+- The GPU lock (`POST /gpu-lock/acquire`/`/release`) is advisory only —
+  holding a lease does not pause or affect `/v1/chat/completions`
+  admission in any way; the two are independent implementations with no
+  shared state. Same no-fairness-guarantee-among-waiters caveat as the
+  slot path applies. A crashed holder wedges the lock for up to
+  `--gpu-lock-max-hold-secs` before the background reap task frees it —
+  and if that fires on a holder that's merely slow, not crashed, the lock
+  is handed to a second caller while the first is still using the GPU.
 
 ## Where to look next
 

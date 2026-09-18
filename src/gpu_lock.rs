@@ -315,6 +315,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_late_release_after_reap_cannot_steal_the_next_holders_lock() {
+        // The reap path is the only way a holder loses its lease without
+        // knowing -- so it's the only realistic source of a stale release
+        // in production. A held lease that gets reaped and then the
+        // original (now-stale) holder calls release() must not be able to
+        // affect whatever new lease has since been issued.
+        let lock = GpuLock::new(Duration::from_millis(50));
+        let stale = lock.acquire(Duration::from_secs(1)).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        lock.reap_expired();
+
+        let fresh = lock.acquire(Duration::from_secs(1)).await.unwrap();
+
+        // The stale holder's late release must be rejected, not silently
+        // succeed and free the fresh holder's lock out from under it.
+        let result = lock.release(stale);
+        assert!(matches!(result, Err(GpuLockError::UnknownLease)));
+        assert!(lock.is_held(), "fresh holder's lease must still be held");
+
+        lock.release(fresh).unwrap();
+    }
+
+    #[tokio::test]
     async fn reap_expired_wakes_a_queued_waiter() {
         // Same reasoning as Scheduler's own
         // `reconcile_seeded_idle_wakes_a_queued_waiter` -- force-freeing the
