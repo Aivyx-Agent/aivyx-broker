@@ -3,7 +3,8 @@ name = "aivyx-broker"
 description = "Multi-process GPU-slot scheduling broker for local llama-server deployments"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "BUSL-1.1"
+publish = false
 
 [[bin]]
 name = "aivyx-broker"
