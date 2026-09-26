@@ -74,7 +74,9 @@ safe to expose beyond `127.0.0.1`.
   lock (`VramCache`), so concurrent polls share one `nvidia-smi` fork;
   an in-flight guard never starts a probe while one is still out (a
   D-state `nvidia-smi` can't be reaped, so at most one thread is pinned),
-  and a timed-out probe backs off 30s (`VRAM_TIMEOUT_BACKOFF`).
+  and a timed-out probe (hung past 2.5s, or killed at its own 2s deadline)
+  backs off 30s (`VRAM_TIMEOUT_BACKOFF`). While a probe is out, the last
+  reading is served only if it is under 30s old; otherwise `vram: null`.
 
 ## Where to look next
 

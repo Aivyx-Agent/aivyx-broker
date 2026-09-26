@@ -43,7 +43,8 @@ pub const VRAM_TIMEOUT_BACKOFF: Duration = Duration::from_secs(30);
 /// lock: the lock is held while probing, so concurrent residency requests
 /// share one probe (one `nvidia-smi` fork) instead of each spawning their
 /// own. A result is reused for [`VRAM_CACHE_TTL`], or for
-/// [`VRAM_TIMEOUT_BACKOFF`] when the probe timed out. A waiter never waits
+/// [`VRAM_TIMEOUT_BACKOFF`] when the probe timed out (here, or inside
+/// `nvidia-smi`'s own deadline). A waiter never waits
 /// longer than the holder's [`RESIDENCY_PROBE_DEADLINE`].
 ///
 /// `in_flight` guards against stacking probes: a probe outliving its
@@ -85,9 +86,13 @@ impl VramCache {
         {
             return reading.vram;
         }
-        // A previous probe is still out (hung): don't stack another.
+        // A previous probe is still out (hung): don't stack another. Serve
+        // the last reading only while it's recent enough to still describe
+        // the GPU.
         if self.in_flight.swap(true, Ordering::SeqCst) {
-            return last.and_then(|r| r.vram);
+            return last
+                .filter(|r| r.taken.elapsed() < VRAM_TIMEOUT_BACKOFF)
+                .and_then(|r| r.vram);
         }
         let guard = InFlight(Arc::clone(&self.in_flight));
         let probe = Arc::clone(probe);
@@ -96,7 +101,17 @@ impl VramCache {
             let _guard = guard;
             probe.vram()
         });
+        let started = Instant::now();
         let (vram, fresh_for) = match tokio::time::timeout(RESIDENCY_PROBE_DEADLINE, task).await {
+            // Nothing, after running into nvidia-smi's own deadline: it was
+            // killed as too slow, so back off like a hung probe rather than
+            // pay that deadline on every poll.
+            Ok(joined)
+                if started.elapsed() >= crate::gpu::NVIDIA_SMI_TIMEOUT
+                    && joined.as_ref().is_ok_and(Option::is_none) =>
+            {
+                (None, VRAM_TIMEOUT_BACKOFF)
+            }
             Ok(joined) => (joined.ok().flatten(), VRAM_CACHE_TTL),
             Err(_) => (None, VRAM_TIMEOUT_BACKOFF),
         };
@@ -635,6 +650,55 @@ mod tests {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(cache.get(&dyn_probe).await.is_some());
         assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A slow `nvidia-smi`: killed at its own deadline, so the probe
+    /// returns `None` after about [`crate::gpu::NVIDIA_SMI_TIMEOUT`].
+    struct SlowProbe(std::sync::atomic::AtomicUsize);
+
+    impl crate::gpu::GpuProbe for SlowProbe {
+        fn vram(&self) -> Option<crate::gpu::Vram> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(crate::gpu::NVIDIA_SMI_TIMEOUT + Duration::from_millis(50));
+            None
+        }
+    }
+
+    /// Re-review R3 — a probe the deadline killed backs off like a hung
+    /// one, instead of costing every poll another two seconds.
+    #[tokio::test]
+    async fn a_probe_killed_at_its_deadline_backs_off() {
+        let cache = VramCache::default();
+        let probe = Arc::new(SlowProbe(std::sync::atomic::AtomicUsize::new(0)));
+        let dyn_probe: Arc<dyn crate::gpu::GpuProbe> = probe.clone();
+        assert_eq!(cache.get(&dyn_probe).await, None);
+        // Past the ordinary 2 s TTL, well inside the 30 s backoff.
+        tokio::time::sleep(VRAM_CACHE_TTL + Duration::from_millis(200)).await;
+        assert_eq!(cache.get(&dyn_probe).await, None);
+        assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Re-review R4 — while a probe is stuck, an old reading isn't served
+    /// as current.
+    #[tokio::test]
+    async fn a_stale_reading_is_not_served_while_a_probe_is_stuck() {
+        let cache = VramCache::default();
+        *cache.last.lock().await = Some(VramReading {
+            taken: Instant::now()
+                .checked_sub(VRAM_TIMEOUT_BACKOFF + Duration::from_secs(1))
+                .unwrap(),
+            vram: Some(crate::gpu::Vram {
+                total_bytes: 2,
+                used_bytes: 1,
+            }),
+            fresh_for: VRAM_CACHE_TTL,
+        });
+        cache
+            .in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let probe: Arc<dyn crate::gpu::GpuProbe> =
+            Arc::new(CountingProbe(std::sync::atomic::AtomicUsize::new(0)));
+        assert_eq!(cache.get(&probe).await, None);
     }
 
     #[tokio::test]
