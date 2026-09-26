@@ -60,6 +60,11 @@ pub struct BrokerConfig {
         default_value_t = 900
     )]
     pub gpu_lock_max_hold_secs: u64,
+
+    /// Where `GET /v1/aivyx/residency` reads GPU memory from: `auto`
+    /// (nvidia-smi, else AMD sysfs), `nvidia`, `amd`, or `none`.
+    #[arg(long, env = "AIVYX_BROKER_VRAM_SOURCE", value_enum, default_value_t = crate::gpu::VramSource::Auto)]
+    pub vram_source: crate::gpu::VramSource,
 }
 
 #[cfg(test)]
@@ -99,5 +104,26 @@ mod tests {
         ]);
         assert_eq!(cfg.port, 9999);
         assert_eq!(cfg.queue_timeout_secs, 5);
+    }
+
+    #[test]
+    fn vram_source_defaults_to_auto_and_parses() {
+        let base = [
+            "aivyx-broker",
+            "--llama-server-url",
+            "http://x",
+            "--kvcache-store-path",
+            "/tmp/k",
+        ];
+        assert_eq!(
+            BrokerConfig::parse_from(base).vram_source,
+            crate::gpu::VramSource::Auto
+        );
+        let mut none = base.to_vec();
+        none.extend(["--vram-source", "none"]);
+        assert_eq!(
+            BrokerConfig::parse_from(none).vram_source,
+            crate::gpu::VramSource::None
+        );
     }
 }

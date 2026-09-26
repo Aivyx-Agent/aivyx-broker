@@ -1,4 +1,5 @@
 pub mod config;
+pub mod gpu;
 pub mod gpu_lock;
 pub mod llama_client;
 pub mod scheduler;
