@@ -67,8 +67,11 @@ safe to expose beyond `127.0.0.1`.
   is handed to a second caller while the first is still using the GPU.
 - `GET /v1/aivyx/residency` VRAM is host-wide and best-effort:
   `nvidia-smi` sums every NVIDIA GPU (layer-split multi-GPU is one pool);
-  on AMD, only the card with the most VRAM counts; each request spawns
-  `nvidia-smi` (cheap, and callers poll on a ~5s TTL, never per request).
+  on AMD, only the card with the most VRAM counts. `nvidia-smi` is killed
+  after 2s (`NVIDIA_SMI_TIMEOUT`; a wedged driver can hang it), a
+  residency request waits at most 2.5s for the probe before answering
+  `vram: null`, and one result is cached for 2s behind a single-flight
+  lock (`VramCache`), so concurrent polls share one `nvidia-smi` fork.
 
 ## Where to look next
 

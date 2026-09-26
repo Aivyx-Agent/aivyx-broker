@@ -5,6 +5,8 @@
 //! most VRAM via sysfs. Best-effort: `None` when neither answers.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 pub(crate) const MIB: u64 = 1024 * 1024;
 
@@ -55,18 +57,57 @@ impl GpuProbe for SystemGpuProbe {
     }
 }
 
+/// How long `nvidia-smi` may run. It hangs when the driver is wedged or a
+/// GPU has fallen off the bus; past this it is killed and VRAM is unknown.
+pub const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn nvidia() -> Option<Vram> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.total,memory.used",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=memory.total,memory.used",
+        "--format=csv,noheader,nounits",
+    ]);
+    let out = run_with_deadline(cmd, NVIDIA_SMI_TIMEOUT)?;
+    parse_nvidia_smi(&String::from_utf8_lossy(&out))
+}
+
+/// Runs `cmd` and returns its stdout if it exits successfully within
+/// `timeout`. Past the deadline the child is killed and reaped, and the
+/// result is `None`. Polls rather than blocking on `wait`, so a hung child
+/// never pins the calling thread. Stdout is read after exit, so this suits
+/// commands with small output (a full pipe would stall the child until the
+/// deadline).
+pub(crate) fn run_with_deadline(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    const POLL: Duration = Duration::from_millis(20);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
+            // Timed out, or can't tell: kill and reap.
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    parse_nvidia_smi(&String::from_utf8_lossy(&out.stdout))
+    let mut out = Vec::new();
+    child.stdout.take()?.read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 /// One `"<total MiB>, <used MiB>"` line per GPU, summed.
@@ -165,6 +206,42 @@ mod tests {
         std::fs::create_dir_all(root.path().join("card0").join("device")).unwrap();
         assert_eq!(amd(root.path()), None);
         assert_eq!(amd(&root.path().join("missing")), None);
+    }
+
+    #[test]
+    fn a_mixed_line_with_na_makes_the_whole_probe_none() {
+        assert_eq!(parse_nvidia_smi("24564, 1000\n[N/A], [N/A]\n"), None);
+    }
+
+    #[test]
+    fn run_with_deadline_returns_a_quick_commands_stdout() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("23028, 689");
+        assert_eq!(
+            run_with_deadline(cmd, Duration::from_secs(2)),
+            Some(b"23028, 689\n".to_vec())
+        );
+        assert_eq!(
+            run_with_deadline(Command::new("false"), Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            run_with_deadline(
+                Command::new("/nonexistent/nvidia-smi"),
+                Duration::from_secs(2)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn run_with_deadline_kills_a_hung_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let start = std::time::Instant::now();
+        assert_eq!(run_with_deadline(cmd, Duration::from_millis(200)), None);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
     #[test]

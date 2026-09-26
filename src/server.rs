@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -21,6 +21,54 @@ pub struct AppState {
     pub gpu_lock_queue_timeout: Duration,
     /// Host VRAM for `/v1/aivyx/residency`.
     pub gpu_probe: Arc<dyn crate::gpu::GpuProbe>,
+    /// The last `gpu_probe` result, shared by concurrent residency requests.
+    pub vram_cache: VramCache,
+}
+
+/// The longest a residency request waits on the GPU probe. Past it, `vram`
+/// is `null`; the probe's own thread finishes (or is bounded by
+/// `gpu::NVIDIA_SMI_TIMEOUT`) in the background.
+pub const RESIDENCY_PROBE_DEADLINE: Duration = Duration::from_millis(2500);
+
+/// How long a probe result is reused.
+pub const VRAM_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// The last GPU probe result and when it was taken, behind a single-flight
+/// lock: the lock is held while probing, so concurrent residency requests
+/// share one probe (one `nvidia-smi` fork) instead of each spawning their
+/// own. A result younger than [`VRAM_CACHE_TTL`] is reused, including a
+/// `None` from a timed-out probe, so a wedged GPU is re-probed at most once
+/// per TTL. A waiter never waits longer than the holder's
+/// [`RESIDENCY_PROBE_DEADLINE`].
+#[derive(Clone, Default)]
+pub struct VramCache(Arc<tokio::sync::Mutex<Option<VramReading>>>);
+
+/// One probe result and when it was taken.
+type VramReading = (Instant, Option<crate::gpu::Vram>);
+
+impl VramCache {
+    /// The cached VRAM, or a fresh probe of `probe` bounded by
+    /// [`RESIDENCY_PROBE_DEADLINE`].
+    async fn get(&self, probe: &Arc<dyn crate::gpu::GpuProbe>) -> Option<crate::gpu::Vram> {
+        let mut cached = self.0.lock().await;
+        if let Some((taken, vram)) = *cached
+            && taken.elapsed() < VRAM_CACHE_TTL
+        {
+            return vram;
+        }
+        let probe = Arc::clone(probe);
+        // nvidia-smi is a blocking subprocess.
+        let vram = tokio::time::timeout(
+            RESIDENCY_PROBE_DEADLINE,
+            tokio::task::spawn_blocking(move || probe.vram()),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+        *cached = Some((Instant::now(), vram));
+        vram
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -49,12 +97,7 @@ async fn residency(State(state): State<AppState>) -> impl IntoResponse {
     let models = crate::llama_client::fetch_models(&state.http, &state.llama_server_url)
         .await
         .unwrap_or_default();
-    let probe = Arc::clone(&state.gpu_probe);
-    // nvidia-smi is a blocking subprocess.
-    let vram = tokio::task::spawn_blocking(move || probe.vram())
-        .await
-        .ok()
-        .flatten();
+    let vram = state.vram_cache.get(&state.gpu_probe).await;
     let slots = state.scheduler.snapshot();
     let busy = slots.iter().filter(|s| s.busy).count() as u32;
     Json(serde_json::json!({
@@ -393,6 +436,7 @@ mod tests {
             gpu_lock: crate::gpu_lock::GpuLock::new(Duration::from_secs(600)),
             gpu_lock_queue_timeout: Duration::from_secs(5),
             gpu_probe: Arc::new(FakeProbe(None)),
+            vram_cache: VramCache::default(),
         };
         (state, dir)
     }
@@ -458,6 +502,58 @@ mod tests {
             got,
             serde_json::json!({"models": [], "vram": null, "slots": {"busy": 0, "total": 2}})
         );
+    }
+
+    /// A wedged `nvidia-smi`: sleeps far past the residency deadline.
+    struct HungProbe;
+
+    impl crate::gpu::GpuProbe for HungProbe {
+        fn vram(&self) -> Option<crate::gpu::Vram> {
+            std::thread::sleep(Duration::from_secs(5));
+            Some(crate::gpu::Vram {
+                total_bytes: 1,
+                used_bytes: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_gpu_probe_still_answers_within_the_deadline() {
+        let (mut state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        state.gpu_probe = Arc::new(HungProbe);
+        let start = std::time::Instant::now();
+        let got = get_json(build_router(state), "/v1/aivyx/residency").await;
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
+        assert_eq!(got["vram"], serde_json::Value::Null);
+    }
+
+    struct CountingProbe(std::sync::atomic::AtomicUsize);
+
+    impl crate::gpu::GpuProbe for CountingProbe {
+        fn vram(&self) -> Option<crate::gpu::Vram> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(crate::gpu::Vram {
+                total_bytes: 2,
+                used_bytes: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn back_to_back_residency_requests_share_one_probe() {
+        let (mut state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let probe = Arc::new(CountingProbe(std::sync::atomic::AtomicUsize::new(0)));
+        state.gpu_probe = probe.clone();
+        let app = build_router(state);
+        for _ in 0..2 {
+            let got = get_json(app.clone(), "/v1/aivyx/residency").await;
+            assert_eq!(
+                got["vram"],
+                serde_json::json!({"total_bytes": 2, "used_bytes": 1})
+            );
+        }
+        assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

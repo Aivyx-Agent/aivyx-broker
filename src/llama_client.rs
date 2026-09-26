@@ -46,25 +46,26 @@ pub struct LoadedModel {
 }
 
 /// `GET /models`: router mode's `status.value` (`loaded`/`loading` ⇒
-/// loaded), or no status at all — a single-model server, whose one
-/// model is loaded.
+/// loaded, `unloaded`/`sleeping` ⇒ not loaded, anything else skipped —
+/// the same rule as `aivyx-route`'s own reader), or no status at all — a
+/// single-model server, whose one model is loaded. `None` when `data` is
+/// missing or any entry lacks a string `id`.
 pub(crate) fn parse_models(json: &serde_json::Value) -> Option<Vec<LoadedModel>> {
-    json.get("data")?
-        .as_array()?
-        .iter()
-        .map(|m| {
-            let id = m.get("id")?.as_str()?.to_string();
-            let loaded = match m
-                .get("status")
-                .and_then(|s| s.get("value"))
-                .and_then(serde_json::Value::as_str)
-            {
-                None => true,
-                Some(value) => matches!(value, "loaded" | "loading"),
-            };
-            Some(LoadedModel { id, loaded })
-        })
-        .collect()
+    let mut models = Vec::new();
+    for m in json.get("data")?.as_array()? {
+        let id = m.get("id")?.as_str()?.to_string();
+        let loaded = match m
+            .get("status")
+            .and_then(|s| s.get("value"))
+            .and_then(serde_json::Value::as_str)
+        {
+            None | Some("loaded" | "loading") => true,
+            Some("unloaded" | "sleeping") => false,
+            Some(_) => continue,
+        };
+        models.push(LoadedModel { id, loaded });
+    }
+    Some(models)
 }
 
 pub async fn fetch_models(
@@ -155,14 +156,17 @@ mod tests {
             {"id": "a", "status": {"value": "loaded"}},
             {"id": "b", "status": {"value": "loading"}},
             {"id": "c", "status": {"value": "unloaded"}},
-            {"id": "d", "status": {"value": "sleeping", "args": []}}
+            {"id": "d", "status": {"value": "sleeping", "args": []}},
+            {"id": "e", "status": {"value": "reticulating"}}
         ]});
         let got = parse_models(&router).unwrap();
         let loaded: Vec<(&str, bool)> = got.iter().map(|m| (m.id.as_str(), m.loaded)).collect();
+        // An unknown status is skipped, as aivyx-route's own reader does.
         assert_eq!(
             loaded,
             [("a", true), ("b", true), ("c", false), ("d", false)]
         );
+        assert!(!got.iter().any(|m| m.id == "e"));
         // Single-model llama-server: no status, its one model is loaded.
         let single = serde_json::json!({"data": [{"id": "only", "object": "model"}]});
         assert_eq!(
