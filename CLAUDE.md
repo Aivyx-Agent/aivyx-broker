@@ -71,7 +71,10 @@ safe to expose beyond `127.0.0.1`.
   after 2s (`NVIDIA_SMI_TIMEOUT`; a wedged driver can hang it), a
   residency request waits at most 2.5s for the probe before answering
   `vram: null`, and one result is cached for 2s behind a single-flight
-  lock (`VramCache`), so concurrent polls share one `nvidia-smi` fork.
+  lock (`VramCache`), so concurrent polls share one `nvidia-smi` fork;
+  an in-flight guard never starts a probe while one is still out (a
+  D-state `nvidia-smi` can't be reaped, so at most one thread is pinned),
+  and a timed-out probe backs off 30s (`VRAM_TIMEOUT_BACKOFF`).
 
 ## Where to look next
 

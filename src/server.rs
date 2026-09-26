@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -33,40 +34,77 @@ pub const RESIDENCY_PROBE_DEADLINE: Duration = Duration::from_millis(2500);
 /// How long a probe result is reused.
 pub const VRAM_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// How long a timed-out probe's `None` is kept before probing again: a
+/// probe that blew its deadline points at a wedged driver, which a 2 s
+/// retry cadence would only pile onto.
+pub const VRAM_TIMEOUT_BACKOFF: Duration = Duration::from_secs(30);
+
 /// The last GPU probe result and when it was taken, behind a single-flight
 /// lock: the lock is held while probing, so concurrent residency requests
 /// share one probe (one `nvidia-smi` fork) instead of each spawning their
-/// own. A result younger than [`VRAM_CACHE_TTL`] is reused, including a
-/// `None` from a timed-out probe, so a wedged GPU is re-probed at most once
-/// per TTL. A waiter never waits longer than the holder's
-/// [`RESIDENCY_PROBE_DEADLINE`].
+/// own. A result is reused for [`VRAM_CACHE_TTL`], or for
+/// [`VRAM_TIMEOUT_BACKOFF`] when the probe timed out. A waiter never waits
+/// longer than the holder's [`RESIDENCY_PROBE_DEADLINE`].
+///
+/// `in_flight` guards against stacking probes: a probe outliving its
+/// deadline (an `nvidia-smi` in uninterruptible sleep never reaps, so its
+/// blocking thread stays pinned) keeps the flag set until it actually
+/// returns, and while it is set no new probe starts — the last cached
+/// value (or `None`) is served instead. At most one blocking thread is
+/// ever pinned by the probe.
 #[derive(Clone, Default)]
-pub struct VramCache(Arc<tokio::sync::Mutex<Option<VramReading>>>);
+pub struct VramCache {
+    last: Arc<tokio::sync::Mutex<Option<VramReading>>>,
+    in_flight: Arc<AtomicBool>,
+}
 
-/// One probe result and when it was taken.
-type VramReading = (Instant, Option<crate::gpu::Vram>);
+/// One probe result, when it was taken, and how long it stays fresh.
+#[derive(Clone, Copy)]
+struct VramReading {
+    taken: Instant,
+    vram: Option<crate::gpu::Vram>,
+    fresh_for: Duration,
+}
+
+/// Clears the in-flight flag when the probe closure finishes (or panics).
+struct InFlight(Arc<AtomicBool>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 impl VramCache {
     /// The cached VRAM, or a fresh probe of `probe` bounded by
     /// [`RESIDENCY_PROBE_DEADLINE`].
     async fn get(&self, probe: &Arc<dyn crate::gpu::GpuProbe>) -> Option<crate::gpu::Vram> {
-        let mut cached = self.0.lock().await;
-        if let Some((taken, vram)) = *cached
-            && taken.elapsed() < VRAM_CACHE_TTL
+        let mut last = self.last.lock().await;
+        if let Some(reading) = *last
+            && reading.taken.elapsed() < reading.fresh_for
         {
-            return vram;
+            return reading.vram;
         }
+        // A previous probe is still out (hung): don't stack another.
+        if self.in_flight.swap(true, Ordering::SeqCst) {
+            return last.and_then(|r| r.vram);
+        }
+        let guard = InFlight(Arc::clone(&self.in_flight));
         let probe = Arc::clone(probe);
         // nvidia-smi is a blocking subprocess.
-        let vram = tokio::time::timeout(
-            RESIDENCY_PROBE_DEADLINE,
-            tokio::task::spawn_blocking(move || probe.vram()),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten();
-        *cached = Some((Instant::now(), vram));
+        let task = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            probe.vram()
+        });
+        let (vram, fresh_for) = match tokio::time::timeout(RESIDENCY_PROBE_DEADLINE, task).await {
+            Ok(joined) => (joined.ok().flatten(), VRAM_CACHE_TTL),
+            Err(_) => (None, VRAM_TIMEOUT_BACKOFF),
+        };
+        *last = Some(VramReading {
+            taken: Instant::now(),
+            vram,
+            fresh_for,
+        });
         vram
     }
 }
@@ -538,6 +576,65 @@ mod tests {
                 used_bytes: 1,
             })
         }
+    }
+
+    /// A wedged `nvidia-smi` stuck in D state: blocks until the test drops
+    /// the gate's sender (so the runtime can shut down promptly), and
+    /// counts how often it was started.
+    struct GatedHungProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::gpu::GpuProbe for GatedHungProbe {
+        fn vram(&self) -> Option<crate::gpu::Vram> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self
+                .gate
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(60));
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_probe_is_never_stacked_past_the_cache_ttl() {
+        let (mut state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let (release, gate) = std::sync::mpsc::channel();
+        let probe = Arc::new(GatedHungProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            gate: std::sync::Mutex::new(gate),
+        });
+        state.gpu_probe = probe.clone();
+        let app = build_router(state);
+        let got = get_json(app.clone(), "/v1/aivyx/residency").await;
+        assert_eq!(got["vram"], serde_json::Value::Null);
+        // Past the 2 s TTL; the first probe is still hung.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        let got = get_json(app, "/v1/aivyx/residency").await;
+        assert_eq!(got["vram"], serde_json::Value::Null);
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn an_outstanding_probe_blocks_a_new_one_even_after_the_backoff() {
+        // The in-flight guard alone: nothing cached, a probe still out.
+        let cache = VramCache::default();
+        cache
+            .in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let probe = Arc::new(CountingProbe(std::sync::atomic::AtomicUsize::new(0)));
+        let dyn_probe: Arc<dyn crate::gpu::GpuProbe> = probe.clone();
+        assert_eq!(cache.get(&dyn_probe).await, None);
+        assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Once it returns, probing resumes.
+        cache
+            .in_flight
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(cache.get(&dyn_probe).await.is_some());
+        assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
