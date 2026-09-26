@@ -19,6 +19,8 @@ pub struct AppState {
     pub queue_timeout: Duration,
     pub gpu_lock: crate::gpu_lock::GpuLock,
     pub gpu_lock_queue_timeout: Duration,
+    /// Host VRAM for `/v1/aivyx/residency`.
+    pub gpu_probe: Arc<dyn crate::gpu::GpuProbe>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -26,6 +28,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/status", get(status))
         .route("/slots", get(slots))
+        .route("/v1/aivyx/residency", get(residency))
         .route("/gpu-lock/acquire", post(gpu_lock_acquire))
         .route("/gpu-lock/release", post(gpu_lock_release))
         .with_state(state)
@@ -37,6 +40,28 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn slots(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!(state.scheduler.snapshot()))
+}
+
+/// Model routing Part 4 — read-only residency for `aivyx-route`: the
+/// upstream's models (loaded or not), host VRAM, and slot pressure.
+/// Every part is best-effort; this always answers.
+async fn residency(State(state): State<AppState>) -> impl IntoResponse {
+    let models = crate::llama_client::fetch_models(&state.http, &state.llama_server_url)
+        .await
+        .unwrap_or_default();
+    let probe = Arc::clone(&state.gpu_probe);
+    // nvidia-smi is a blocking subprocess.
+    let vram = tokio::task::spawn_blocking(move || probe.vram())
+        .await
+        .ok()
+        .flatten();
+    let slots = state.scheduler.snapshot();
+    let busy = slots.iter().filter(|s| s.busy).count() as u32;
+    Json(serde_json::json!({
+        "models": models,
+        "vram": vram,
+        "slots": { "busy": busy, "total": slots.len() as u32 },
+    }))
 }
 
 async fn gpu_lock_acquire(State(state): State<AppState>) -> axum::response::Response {
@@ -367,8 +392,72 @@ mod tests {
             queue_timeout: Duration::from_secs(5),
             gpu_lock: crate::gpu_lock::GpuLock::new(Duration::from_secs(600)),
             gpu_lock_queue_timeout: Duration::from_secs(5),
+            gpu_probe: Arc::new(FakeProbe(None)),
         };
         (state, dir)
+    }
+
+    struct FakeProbe(Option<crate::gpu::Vram>);
+
+    impl crate::gpu::GpuProbe for FakeProbe {
+        fn vram(&self) -> Option<crate::gpu::Vram> {
+            self.0
+        }
+    }
+
+    const CONTRACT: &str = include_str!("../tests/fixtures/broker_residency.json");
+
+    async fn get_json(app: Router, uri: &str) -> serde_json::Value {
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn residency_matches_the_shared_contract() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [
+                        {"id": "qwen3-8b", "status": {"value": "loaded"}},
+                        {"id": "gemma-3-4b", "status": {"value": "unloaded"}}
+                    ]
+                })),
+            )
+            .mount(&upstream)
+            .await;
+        let (mut state, _dir) = test_state(upstream.uri()).await;
+        state.gpu_probe = Arc::new(FakeProbe(Some(crate::gpu::Vram {
+            total_bytes: 25_769_803_776,
+            used_bytes: 9_663_676_416,
+        })));
+        // One of the two slots busy.
+        let _admission = state
+            .scheduler
+            .admit(None, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let got = get_json(build_router(state), "/v1/aivyx/residency").await;
+        let want: serde_json::Value = serde_json::from_str(CONTRACT).unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn residency_without_upstream_or_gpu_still_answers() {
+        let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let got = get_json(build_router(state), "/v1/aivyx/residency").await;
+        assert_eq!(
+            got,
+            serde_json::json!({"models": [], "vram": null, "slots": {"busy": 0, "total": 2}})
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use crate::Scheduler;
 pub enum LlamaClientError {
     #[error("request to llama-server failed: {0}")]
     Request(#[from] reqwest::Error),
-    #[error("failed to parse llama-server /slots response")]
+    #[error("failed to parse a llama-server response")]
     Parse,
 }
 
@@ -36,6 +36,45 @@ pub async fn fetch_slots(
     let resp = client.get(&url).send().await?.error_for_status()?;
     let json: serde_json::Value = resp.json().await?;
     parse_slots(&json).ok_or(LlamaClientError::Parse)
+}
+
+/// One model the upstream `llama-server` knows about.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LoadedModel {
+    pub id: String,
+    pub loaded: bool,
+}
+
+/// `GET /models`: router mode's `status.value` (`loaded`/`loading` ⇒
+/// loaded), or no status at all — a single-model server, whose one
+/// model is loaded.
+pub(crate) fn parse_models(json: &serde_json::Value) -> Option<Vec<LoadedModel>> {
+    json.get("data")?
+        .as_array()?
+        .iter()
+        .map(|m| {
+            let id = m.get("id")?.as_str()?.to_string();
+            let loaded = match m
+                .get("status")
+                .and_then(|s| s.get("value"))
+                .and_then(serde_json::Value::as_str)
+            {
+                None => true,
+                Some(value) => matches!(value, "loaded" | "loading"),
+            };
+            Some(LoadedModel { id, loaded })
+        })
+        .collect()
+}
+
+pub async fn fetch_models(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<LoadedModel>, LlamaClientError> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let json: serde_json::Value = resp.json().await?;
+    parse_models(&json).ok_or(LlamaClientError::Parse)
 }
 
 /// Fetches the real slot count/state from `llama-server` and seeds
@@ -108,6 +147,32 @@ mod tests {
                 is_processing: false
             }]
         );
+    }
+
+    #[test]
+    fn parse_models_reads_router_statuses_and_single_model_servers() {
+        let router = serde_json::json!({"data": [
+            {"id": "a", "status": {"value": "loaded"}},
+            {"id": "b", "status": {"value": "loading"}},
+            {"id": "c", "status": {"value": "unloaded"}},
+            {"id": "d", "status": {"value": "sleeping", "args": []}}
+        ]});
+        let got = parse_models(&router).unwrap();
+        let loaded: Vec<(&str, bool)> = got.iter().map(|m| (m.id.as_str(), m.loaded)).collect();
+        assert_eq!(
+            loaded,
+            [("a", true), ("b", true), ("c", false), ("d", false)]
+        );
+        // Single-model llama-server: no status, its one model is loaded.
+        let single = serde_json::json!({"data": [{"id": "only", "object": "model"}]});
+        assert_eq!(
+            parse_models(&single).unwrap(),
+            vec![LoadedModel {
+                id: "only".into(),
+                loaded: true
+            }]
+        );
+        assert!(parse_models(&serde_json::json!({"nope": 1})).is_none());
     }
 
     #[tokio::test]

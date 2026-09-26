@@ -58,6 +58,7 @@ error against its `base_url`, the same shape as `llama-server` being down.
 | `--queue-timeout-secs` | `AIVYX_BROKER_QUEUE_TIMEOUT_SECS` | `60` | How long a request may wait for a free slot before getting a clear `503` instead of hanging |
 | `--gpu-lock-queue-timeout-secs` | `AIVYX_BROKER_GPU_LOCK_QUEUE_TIMEOUT_SECS` | `300` | How long a caller may wait in the GPU-lock queue (see [`POST /gpu-lock/acquire`](#api) below) before getting a clear `503` instead of hanging — longer than `queue-timeout-secs` because a GPU generation job can legitimately queue much longer than a chat turn |
 | `--gpu-lock-max-hold-secs` | `AIVYX_BROKER_GPU_LOCK_MAX_HOLD_SECS` | `900` | Safety valve: a GPU lock lease held longer than this is force-released by a background reap task, on the assumption its holder crashed or disconnected without releasing. If it fires on a holder that's still alive and running (just slow), the lock is handed to a second waiter while the first is still using the GPU -- set it above your worst-case generation time, not merely the typical one |
+| `--vram-source` | `AIVYX_BROKER_VRAM_SOURCE` | `auto` | Where `GET /v1/aivyx/residency` reads host GPU memory from: `auto` (`nvidia-smi`, else AMD sysfs), `nvidia`, `amd`, or `none` to report no VRAM |
 
 ## Pointing a client at the broker
 
@@ -95,6 +96,29 @@ broker now owns that).
   UUID. A lease not released within `--gpu-lock-max-hold-secs` is force-
   released by a background reap task, so a crashed holder can't wedge the
   lock forever.
+- `GET /v1/aivyx/residency` — read-only residency for `aivyx-route` model
+  routing: the upstream's models (loaded or not), host VRAM, and slot
+  pressure. Every part is best-effort and the route always answers `200`,
+  even with no upstream and no GPU reachable:
+  ```json
+  {
+    "models": [
+      {"id": "qwen3-8b", "loaded": true},
+      {"id": "gemma-3-4b", "loaded": false}
+    ],
+    "vram": {"total_bytes": 25769803776, "used_bytes": 9663676416},
+    "slots": {"busy": 1, "total": 2}
+  }
+  ```
+  - `models` — from the upstream `GET /models`, reduced to
+    `{id, loaded}`. Router-mode `status.value` of `loaded`/`loading`
+    counts as loaded, `unloaded`/`sleeping` as not; a single-model
+    `llama-server` with no `status` field at all is loaded. `[]` if the
+    upstream is unreachable or unparseable.
+  - `vram` — host-wide VRAM per `--vram-source` above, or `null` if
+    unreadable.
+  - `slots` — the broker's own scheduler pressure: how many of its slots
+    are currently busy, out of the total.
 
 ## Honest tradeoffs
 

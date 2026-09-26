@@ -26,6 +26,10 @@ As of 2026-09-18 the broker also arbitrates GPU-heavy non-LLM workloads
 lock (`POST /gpu-lock/acquire` / `/gpu-lock/release`) — see
 `src/gpu_lock.rs`'s own doc comment for the full rationale.
 
+As of 2026-09-26 the broker also serves read-only residency
+(`GET /v1/aivyx/residency`) for `aivyx-route` model routing: the
+upstream's models (loaded or not), host VRAM, and slot pressure.
+
 ## Build, run, test, lint
 
 ```sh
@@ -61,6 +65,10 @@ safe to expose beyond `127.0.0.1`.
   `--gpu-lock-max-hold-secs` before the background reap task frees it —
   and if that fires on a holder that's merely slow, not crashed, the lock
   is handed to a second caller while the first is still using the GPU.
+- `GET /v1/aivyx/residency` VRAM is host-wide and best-effort:
+  `nvidia-smi` sums every NVIDIA GPU (layer-split multi-GPU is one pool);
+  on AMD, only the card with the most VRAM counts; each request spawns
+  `nvidia-smi` (cheap, and callers poll on a ~5s TTL, never per request).
 
 ## Where to look next
 
