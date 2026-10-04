@@ -142,7 +142,9 @@ broker now owns that).
   FIFO by arrival order — under contention, a released slot's queued
   waiters race to reclaim it rather than being served in strict order, so
   there's no hard ordering guarantee beyond each request's own queue
-  timeout. Priority/weighting is deferred as a future increment.
+  timeout. Priority/weighting is deferred as a future increment. One
+  exception: a waiter queued for one specific slot is never pre-empted by
+  a general "any free slot" waiter for that same slot.
 - **An abandoned request still holds its slot until `llama-server`
   finishes it.** If a client hangs up after admission, the broker keeps
   reading `llama-server`'s response to the end and only then frees the

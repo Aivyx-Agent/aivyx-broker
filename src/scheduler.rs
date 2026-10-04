@@ -377,24 +377,46 @@ impl Scheduler {
     /// re-queue and keep waiting. This trades strict FIFO ordering for
     /// eliminating the starvation window entirely -- admission is
     /// approximately FIFO by arrival order, not strictly ordered.
+    ///
+    /// Host-and-waiters fix: whether to also wake `global_waiters` this
+    /// round depends on whether this slot has a *live* specific waiter.
+    /// Waking both sets together (the previous behavior) let a global
+    /// waiter win the race to re-lock and admit itself onto this exact
+    /// slot ahead of the specific waiter the slot actually belongs to --
+    /// despite this method's own send-order claiming to wake specific
+    /// waiters "first," send order has no bearing on which woken task's
+    /// `admit()` loop actually resumes and re-locks first (they're
+    /// separate tokio tasks racing a `std::sync::Mutex`). A specific
+    /// waiter's wake `send()` succeeding means a live `Receiver` is still
+    /// out there about to retry `try_admit_locked` with its own
+    /// `preferred_slot`, so global waiters are withheld this round to
+    /// give it first right of refusal; they still get woken on every
+    /// *other* release, so nothing here can strand them past their own
+    /// timeout. If every specific waiter for this slot is already dead
+    /// (timed out and dropped without being drained yet), none of their
+    /// sends succeed, there's no live claimant to defer to, and global
+    /// waiters are woken exactly as before.
     fn wake_waiters_for(inner: &mut Inner, slot_id: u32) {
-        // Wake this slot's specific waiters first (rule: don't let a
-        // global waiter steal a slot someone is specifically waiting on).
-        // Drain the entire queue -- do NOT return after the first
-        // successful send (see above for why: a wake that succeeds but is
-        // never re-polled before the waiter's future is dropped would
-        // otherwise strand everyone behind it). Best-effort: ignore
-        // individual send failures (a `Receiver` already dropped from
-        // timing out or being cancelled).
+        let mut live_specific_waiter = false;
         if let Some(queue) = inner.slot_waiters.get_mut(&slot_id) {
+            // Drain the entire queue -- do NOT stop after the first
+            // successful send (see above for why: a wake that succeeds
+            // but is never re-polled before the waiter's future is
+            // dropped would otherwise strand everyone behind it).
             while let Some(tx) = queue.pop_front() {
-                let _ = tx.send(());
+                if tx.send(()).is_ok() {
+                    live_specific_waiter = true;
+                }
             }
         }
+        if live_specific_waiter {
+            return;
+        }
 
-        // Also wake every global "any free slot" waiter -- this slot is
-        // free now and any of them may be able to claim it (or another
-        // slot that became free in the meantime).
+        // No live specific waiter for this slot: wake every global "any
+        // free slot" waiter -- this slot is free now and any of them may
+        // be able to claim it (or another slot that became free in the
+        // meantime).
         while let Some(tx) = inner.global_waiters.pop_front() {
             let _ = tx.send(());
         }
@@ -910,6 +932,60 @@ mod tests {
             .await
             .unwrap();
         assert!(!c.cache_ready);
+    }
+
+    // --- Host-and-waiters fix: a general waiter must never steal a slot
+    // a specific waiter is already queued for --------------------------
+
+    #[tokio::test]
+    async fn a_general_waiter_cannot_steal_a_slot_a_specific_waiter_is_queued_for() {
+        // `wake_waiters_for`'s own doc comment says it wakes a slot's
+        // specific waiters "first" so a global waiter can't steal a slot
+        // someone is specifically waiting on -- but the wake-send order
+        // has no bearing on which woken task actually wins the race to
+        // re-lock and retry admission. Prove it deterministically (no
+        // reliance on tokio's own task-scheduling order) by hand-polling
+        // both waiters in a chosen sequence: queue the specific waiter B
+        // first, then general waiter A, release the slot, and poll A
+        // before B -- simulating A's task happening to run first.
+        let sched = Scheduler::new(1);
+        let specific_hint = Some(SlotHint {
+            prefix_hash: "p".to_string(),
+            preferred_slot: Some(0),
+            model: None,
+        });
+        let held = sched
+            .admit(specific_hint.clone(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(held.slot_id, 0);
+
+        // Queue specific waiter B first.
+        let sched_b = sched.clone();
+        let mut waiter_b = Box::pin(sched_b.admit(specific_hint.clone(), Duration::from_secs(5)));
+        assert!(futures::poll!(&mut waiter_b).is_pending());
+
+        // Queue general waiter A behind it.
+        let sched_a = sched.clone();
+        let mut waiter_a = Box::pin(sched_a.admit(None, Duration::from_secs(5)));
+        assert!(futures::poll!(&mut waiter_a).is_pending());
+
+        // Free the slot: both get woken.
+        sched.release(0);
+
+        // Poll A (the general waiter) first. It must not be able to claim
+        // slot 0 while B is specifically queued for it -- it should find
+        // nothing admittable and go back to waiting.
+        assert!(
+            futures::poll!(&mut waiter_a).is_pending(),
+            "a general waiter claimed a slot a specific waiter is still queued for"
+        );
+
+        // B must now get it.
+        match futures::poll!(&mut waiter_b) {
+            std::task::Poll::Ready(Ok(admission)) => assert_eq!(admission.slot_id, 0),
+            other => panic!("expected B to be admitted to slot 0, got {other:?}"),
+        }
     }
 
     // --- Fix 7: clear_resident ------------------------------------------

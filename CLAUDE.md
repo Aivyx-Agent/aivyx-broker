@@ -50,7 +50,12 @@ safe to expose beyond `127.0.0.1`.
 - No priority/weighted scheduling in v1. Admission is approximately FIFO
   by arrival order — under contention, a released slot's queued waiters
   race to reclaim it rather than being served in strict order, so there's
-  no hard ordering guarantee beyond each request's own queue timeout.
+  no hard ordering guarantee beyond each request's own queue timeout. One
+  exception: a waiter queued for one *specific* slot (`preferred_slot`)
+  is never pre-empted by a general "any free slot" waiter for that exact
+  slot (see `Scheduler::wake_waiters_for` in `src/scheduler.rs`) — general
+  waiters are only woken on a given release when no live specific waiter
+  was woken for it instead.
 - No persisted broker state across restarts (by design — see the spec's
   "Broker startup/restart" section); a restart loses cross-process
   fairness bookkeeping but never desyncs from `llama-server`'s own
