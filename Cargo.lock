@@ -36,7 +36,7 @@ dependencies = [
 [[package]]
 name = "aivyx-kvcache"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-kvcache?branch=master#bea6a9005b712849b1ef2312aa273fe3698ed1a7"
+source = "git+https://github.com/Aivyx-Agent/aivyx-kvcache?rev=02d96f05aa3a5655a7e59b92d17c1ca19b27c4cb#02d96f05aa3a5655a7e59b92d17c1ca19b27c4cb"
 dependencies = [
  "async-trait",
  "clap",
