@@ -8,6 +8,20 @@ use tokio::sync::oneshot;
 pub struct SlotHint {
     pub prefix_hash: String,
     pub preferred_slot: Option<u32>,
+    /// The request's `model`. Not part of the wire hint: the HTTP handler
+    /// fills it from the request body. A slot's KV content is only valid
+    /// for the model that computed it, so residency matches on
+    /// `(model, prefix_hash)`, never on the prefix alone.
+    #[serde(skip)]
+    pub model: Option<String>,
+}
+
+impl SlotHint {
+    /// Whether `slot` holds this hint's prefix, computed by this hint's model.
+    fn is_resident_in(&self, slot: &SlotState) -> bool {
+        slot.resident_prefix.as_deref() == Some(self.prefix_hash.as_str())
+            && slot.resident_model == self.model
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -15,6 +29,8 @@ pub struct SlotSnapshot {
     pub slot_id: u32,
     pub busy: bool,
     pub resident_prefix: Option<String>,
+    /// The model `resident_prefix` was computed by.
+    pub resident_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +49,9 @@ pub enum SchedulerError {
 struct SlotState {
     busy: bool,
     resident_prefix: Option<String>,
+    /// The model that computed `resident_prefix`'s KV content (the
+    /// request's `model`, `None` if it named none).
+    resident_model: Option<String>,
     /// `true` from `seed_busy()` until the very first time this slot is
     /// successfully claimed by `try_admit_locked` -- i.e. "busy because
     /// `llama-server` reported it mid-generation across a broker restart,
@@ -96,13 +115,14 @@ impl Scheduler {
         }
     }
 
-    /// Records that `slot_id` now holds `prefix_hash`'s content -- called
-    /// by the HTTP handler after a successful restore/warm-then-save, or
-    /// on a fresh admission before forwarding the real request.
-    pub fn mark_resident(&self, slot_id: u32, prefix_hash: String) {
+    /// Records that `slot_id` now holds `prefix_hash`'s content as
+    /// computed by `model` -- called by the HTTP handler after a
+    /// successful restore/warm-then-save.
+    pub fn mark_resident(&self, slot_id: u32, model: Option<String>, prefix_hash: String) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(slot_id as usize) {
             slot.resident_prefix = Some(prefix_hash);
+            slot.resident_model = model;
         }
     }
 
@@ -117,6 +137,7 @@ impl Scheduler {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(slot_id as usize) {
             slot.resident_prefix = None;
+            slot.resident_model = None;
         }
     }
 
@@ -242,7 +263,7 @@ impl Scheduler {
                 slot.seeded_unowned = false;
                 inner.clock += 1;
                 slot.last_used = inner.clock;
-                let cache_ready = slot.resident_prefix.as_deref() == Some(h.prefix_hash.as_str());
+                let cache_ready = h.is_resident_in(slot);
                 return Some(Admission {
                     slot_id: preferred,
                     cache_ready,
@@ -251,13 +272,15 @@ impl Scheduler {
             return None; // must queue for this specific slot
         }
         // No usable preference: any free slot, prefer one already resident
-        // with this exact prefix, else the least-recently-used idle slot
+        // with this exact prefix from this exact model, else the least-recently-used idle slot
         // (see Fix 2 -- "first free slot found" previously kept re-using
         // the same low-numbered slot instead of spreading load).
         if let Some(h) = hint
-            && let Some((idx, slot)) = inner.slots.iter_mut().enumerate().find(|(_, s)| {
-                !s.busy && s.resident_prefix.as_deref() == Some(h.prefix_hash.as_str())
-            })
+            && let Some((idx, slot)) = inner
+                .slots
+                .iter_mut()
+                .enumerate()
+                .find(|(_, s)| !s.busy && h.is_resident_in(s))
         {
             slot.busy = true;
             slot.seeded_unowned = false;
@@ -279,9 +302,7 @@ impl Scheduler {
         slot.seeded_unowned = false;
         inner.clock += 1;
         slot.last_used = inner.clock;
-        let cache_ready = hint
-            .as_ref()
-            .is_some_and(|h| slot.resident_prefix.as_deref() == Some(h.prefix_hash.as_str()));
+        let cache_ready = hint.as_ref().is_some_and(|h| h.is_resident_in(slot));
         Some(Admission {
             slot_id: idx as u32,
             cache_ready,
@@ -299,6 +320,7 @@ impl Scheduler {
                 slot_id: idx as u32,
                 busy: s.busy,
                 resident_prefix: s.resident_prefix.clone(),
+                resident_model: s.resident_model.clone(),
             })
             .collect()
     }
@@ -396,12 +418,13 @@ mod tests {
     async fn second_admission_for_same_prefix_on_idle_slot_is_cache_ready() {
         let sched = Scheduler::new(2);
         let first = sched.admit(None, Duration::from_secs(1)).await.unwrap();
-        sched.mark_resident(first.slot_id, "prefix-a".to_string());
+        sched.mark_resident(first.slot_id, None, "prefix-a".to_string());
         sched.release(first.slot_id);
 
         let hint = Some(SlotHint {
             prefix_hash: "prefix-a".to_string(),
             preferred_slot: None,
+            model: None,
         });
         let second = sched.admit(hint, Duration::from_secs(1)).await.unwrap();
         assert_eq!(second.slot_id, first.slot_id);
@@ -414,6 +437,7 @@ mod tests {
         let hint_a = Some(SlotHint {
             prefix_hash: "a".to_string(),
             preferred_slot: Some(0),
+            model: None,
         });
         let first = sched
             .admit(hint_a.clone(), Duration::from_secs(1))
@@ -460,7 +484,7 @@ mod tests {
     async fn snapshot_reflects_busy_and_resident_state() {
         let sched = Scheduler::new(2);
         let admission = sched.admit(None, Duration::from_secs(1)).await.unwrap();
-        sched.mark_resident(admission.slot_id, "p".to_string());
+        sched.mark_resident(admission.slot_id, None, "p".to_string());
 
         let snap = sched.snapshot();
         let this_slot = snap
@@ -484,6 +508,7 @@ mod tests {
         let hint = Some(SlotHint {
             prefix_hash: "test".to_string(),
             preferred_slot: Some(0),
+            model: None,
         });
 
         // Admit the slot to make it busy.
@@ -510,6 +535,7 @@ mod tests {
         let hint2 = Some(SlotHint {
             prefix_hash: "test".to_string(),
             preferred_slot: Some(0),
+            model: None,
         });
         let second_waiter =
             tokio::spawn(async move { sched_second.admit(hint2, Duration::from_secs(5)).await });
@@ -645,6 +671,7 @@ mod tests {
             let hint = Some(SlotHint {
                 prefix_hash: format!("p{i}"),
                 preferred_slot: None,
+                model: None,
             });
             let admission = sched.admit(hint, Duration::from_secs(1)).await.unwrap();
             slots_used.push(admission.slot_id);
@@ -673,6 +700,7 @@ mod tests {
             let hint = Some(SlotHint {
                 prefix_hash: prefix.to_string(),
                 preferred_slot: None,
+                model: None,
             });
             let admission = sched.admit(hint, Duration::from_secs(1)).await.unwrap();
             slots_used.insert(admission.slot_id);
@@ -741,6 +769,7 @@ mod tests {
         let hint = Some(SlotHint {
             prefix_hash: "p".to_string(),
             preferred_slot: Some(99),
+            model: None,
         });
 
         // Should succeed quickly by falling back to a real slot, not queue
@@ -784,6 +813,7 @@ mod tests {
         let hint = Some(SlotHint {
             prefix_hash: "p".to_string(),
             preferred_slot: Some(99),
+            model: None,
         });
         let sched2 = sched.clone();
         let waiter = tokio::spawn(async move { sched2.admit(hint, Duration::from_secs(60)).await });
@@ -840,6 +870,48 @@ mod tests {
         assert_eq!(admission.slot_id, 0);
     }
 
+    #[tokio::test]
+    async fn a_resident_prefix_from_another_model_is_never_cache_ready() {
+        let hint = |model: &str, preferred_slot| {
+            Some(SlotHint {
+                prefix_hash: "p".to_string(),
+                preferred_slot,
+                model: Some(model.to_string()),
+            })
+        };
+        let sched = Scheduler::new(2);
+        sched.mark_resident(0, Some("model-a".to_string()), "p".to_string());
+        sched.mark_resident(1, Some("model-b".to_string()), "p".to_string());
+
+        // Slot 0 holds "p" for model A; model B asking for it by number
+        // must warm it, not run on A's KV.
+        let b_on_0 = sched
+            .admit(hint("model-b", Some(0)), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(b_on_0.slot_id, 0);
+        assert!(!b_on_0.cache_ready);
+        sched.release(0);
+
+        // Without a preference, each model finds the slot holding its own.
+        for (model, want) in [("model-a", 0), ("model-b", 1)] {
+            let admission = sched
+                .admit(hint(model, None), Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(admission.slot_id, want, "{model}");
+            assert!(admission.cache_ready, "{model}");
+            sched.release(admission.slot_id);
+        }
+
+        // A third model's LRU fallback onto either slot is not cache-ready.
+        let c = sched
+            .admit(hint("model-c", None), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!c.cache_ready);
+    }
+
     // --- Fix 7: clear_resident ------------------------------------------
 
     #[tokio::test]
@@ -848,9 +920,10 @@ mod tests {
         let hint = Some(SlotHint {
             prefix_hash: "a".to_string(),
             preferred_slot: None,
+            model: None,
         });
         let first = sched.admit(hint, Duration::from_secs(1)).await.unwrap();
-        sched.mark_resident(first.slot_id, "a".to_string());
+        sched.mark_resident(first.slot_id, None, "a".to_string());
         sched.release(first.slot_id);
 
         // Hint-less admission lands on the same (only) slot, silently

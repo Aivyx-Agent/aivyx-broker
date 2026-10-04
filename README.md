@@ -79,12 +79,16 @@ broker now owns that).
 - `POST /v1/chat/completions` — OpenAI-compatible, identical to
   `llama-server`'s own endpoint, plus an optional `aivyx_slot_hint` field:
   `{"prefix_hash": "...", "preferred_slot": <u32 or null>}`. Omit it for
-  plain "any free slot" behavior.
+  plain "any free slot" behavior. Cache reuse is per model: a slot or
+  saved KV cache counts as a match only for the same request `model` and
+  `prefix_hash`, so two models sharing a system prompt never run on each
+  other's KV state.
 - `GET /status` — broker health + which `llama-server` it's proxying to.
 - `GET /slots` — the broker's own occupancy view: `{slot_id, busy,
-  resident_prefix}` per slot — a superset of `llama-server`'s own
-  `/slots`, adding which `prefix_hash` is currently resident in each slot
-  (something `llama-server`'s own `/slots` doesn't expose).
+  resident_prefix, resident_model}` per slot — a superset of
+  `llama-server`'s own `/slots`, adding which `prefix_hash` (and from
+  which request `model`) is currently resident in each slot (something
+  `llama-server`'s own `/slots` doesn't expose).
 - `POST /gpu-lock/acquire` — a generic, lease-based exclusive lock for
   GPU-heavy non-LLM generation work (Aivyx-Vision's mold backend),
   deliberately independent of the `/v1/chat/completions` slot-scheduling

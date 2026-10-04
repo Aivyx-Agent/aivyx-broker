@@ -223,10 +223,15 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(mut body): Json<Value>,
 ) -> axum::response::Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let hint = body
         .as_object_mut()
         .and_then(|o| o.remove("aivyx_slot_hint"))
-        .and_then(|v| serde_json::from_value::<crate::SlotHint>(v).ok());
+        .and_then(|v| serde_json::from_value::<crate::SlotHint>(v).ok())
+        .map(|hint| crate::SlotHint { model, ..hint });
 
     let admission = match state
         .scheduler
@@ -423,9 +428,13 @@ async fn warm_or_restore(
     hint: &crate::SlotHint,
     slot_id: u32,
 ) -> Result<(), anyhow::Error> {
+    // Saved KV state is only valid for the model that computed it, so the
+    // request's `model` is part of the key: a prefix saved for one model
+    // is never restored into a request for another. (`""` when the request
+    // names no model -- a single-model llama-server.)
     let key = aivyx_kvcache::CacheKey {
         backend_id: "aivyx-broker".to_string(),
-        model_id: "aivyx-broker".to_string(),
+        model_id: hint.model.clone().unwrap_or_default(),
         build_hash: "aivyx-broker".to_string(),
         prefix_hash: hint.prefix_hash.clone(),
     };
@@ -464,6 +473,12 @@ async fn warm_or_restore(
         if let Some(tools) = tools {
             warm_up["tools"] = tools;
         }
+        // Warm the slot with the model the real request is for: a
+        // router-mode llama-server would otherwise warm (and we'd save) the
+        // default model's KV under this model's key.
+        if let Some(model) = &hint.model {
+            warm_up["model"] = serde_json::json!(model);
+        }
         state
             .http
             .post(format!(
@@ -493,7 +508,7 @@ async fn warm_or_restore(
 
     state
         .scheduler
-        .mark_resident(slot_id, hint.prefix_hash.clone());
+        .mark_resident(slot_id, hint.model.clone(), hint.prefix_hash.clone());
     Ok(())
 }
 
@@ -1104,6 +1119,107 @@ mod tests {
         .await
         .expect("slot never released after the upstream stream ended");
         assert!(upstream_done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn two_models_with_the_same_prefix_never_share_a_saved_or_resident_slot() {
+        // A fake llama-server that accepts completions, slot saves and slot
+        // restores. One broker slot, so both models land on the same slot.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/slots/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let (mut state, _dir) = test_state(server.uri()).await;
+        state.scheduler = Scheduler::new(1);
+        let app = build_router(state);
+
+        let request = |model: &str| {
+            serde_json::json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "hi"}
+                ],
+                "aivyx_slot_hint": {"prefix_hash": "shared", "preferred_slot": null}
+            })
+        };
+        let mut seen = 0;
+        let mut send = async |model: &str| {
+            let response = app
+                .clone()
+                .oneshot(chat_request(&request(model)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let all = server.received_requests().await.unwrap();
+            let new = all[seen..].to_vec();
+            seen = all.len();
+            new
+        };
+        let warm_ups = |reqs: &[wiremock::Request]| -> Vec<serde_json::Value> {
+            reqs.iter()
+                .filter(|r| r.url.path() == "/v1/chat/completions")
+                .map(|r| r.body_json::<serde_json::Value>().unwrap())
+                .filter(|b| b.get("max_tokens") == Some(&serde_json::json!(1)))
+                .collect()
+        };
+        let restores = |reqs: &[wiremock::Request]| -> Vec<String> {
+            reqs.iter()
+                .filter(|r| r.url.query() == Some("action=restore"))
+                .map(|r| {
+                    r.body_json::<serde_json::Value>().unwrap()["filename"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+
+        // Model A, cold: warmed for model A.
+        let a = send("model-a").await;
+        assert!(restores(&a).is_empty());
+        let w = warm_ups(&a);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0]["model"], "model-a");
+
+        // Model B, same prefix: the slot holds model A's prefix, and model
+        // A's save is on disk, but neither is model B's. Warmed for B.
+        let b = send("model-b").await;
+        assert!(
+            restores(&b).is_empty(),
+            "model B restored model A's saved slot: {:?}",
+            restores(&b)
+        );
+        let w = warm_ups(&b);
+        assert_eq!(
+            w.len(),
+            1,
+            "model B reused model A's resident slot unwarmed"
+        );
+        assert_eq!(w[0]["model"], "model-b");
+
+        // Back to model A: the slot now holds B, so A restores its own save.
+        let a2 = send("model-a").await;
+        let r = restores(&a2);
+        assert_eq!(
+            r.len(),
+            1,
+            "model A treated model B's resident slot as its own"
+        );
+        assert!(r[0].contains("model_a"), "restored {:?}", r[0]);
+        assert!(warm_ups(&a2).is_empty());
     }
 
     #[tokio::test]

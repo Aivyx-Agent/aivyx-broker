@@ -98,7 +98,7 @@ Components inside `aivyx-broker`:
   endpoint (switching either client is a `base_url` config change, zero
   `LlmBackend` code changes) plus a small admin surface (`/status`,
   `/slots`).
-- A scheduler core: in-memory occupancy table (slot → `{holder, prefix_hash,
+- A scheduler core: in-memory occupancy table (slot → `{holder, model, prefix_hash,
   state}`) plus a FIFO wait queue per contested slot and one global FIFO
   queue for "any free slot" requests. Rebuilt from `llama-server`'s real
   `GET /slots` on every broker startup.
@@ -120,9 +120,13 @@ Components inside `aivyx-broker`:
   broker's single `/v1/chat/completions` call, the client can no longer
   do its own restore first — it doesn't know the slot number yet. So
   `aivyx-broker` depends on `aivyx-kvcache` directly and drives
-  `restore_into_slot`/`save_from_slot` itself, using each client's
-  `prefix_hash` hint as the `CacheKey`. Concretely, on each request: if
-  the hint's `prefix_hash` is already the *current* occupant of some slot
+  `restore_into_slot`/`save_from_slot` itself, keyed by the request's
+  `model` plus the client's `prefix_hash` hint (`CacheKey.model_id` is
+  the request's `model`, `""` when it names none; KV state computed by one
+  model is meaningless to another, so a prefix saved for model A is never
+  restored for model B, and the warm-up request carries the real
+  request's `model`). Concretely, on each request: if the hint's
+  `(model, prefix_hash)` is already the *current* occupant of some slot
   in the broker's own occupancy table (i.e. the same session's own prior
   turn, still resident), admit straight to that slot — no restore/save
   needed, since the slot's live content already matches and llama-server
