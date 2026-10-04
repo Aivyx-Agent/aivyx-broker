@@ -224,7 +224,13 @@ mid-stream — the forwarding task keeps reading `llama-server`'s response
 to the end (discarding it) and only then frees the slot; otherwise the
 next request would be admitted onto a slot `llama-server` is still busy
 with. The upstream client's 300s read timeout bounds how long an
-abandoned job can hold it. A client that disconnects while still *queued*
+abandoned job can hold it. A client that stays connected but stops
+reading counts as gone once a body chunk has waited 30s
+(`CLIENT_SEND_TIMEOUT`) for room in the 16-chunk forwarding buffer: the
+task drains the rest without it (otherwise it would stop reading
+upstream, the read timeout would never fire, and the slot would be held
+until the client's TCP connection died), and that client's body ends in
+an error rather than a truncated response that looks complete. A client that disconnects while still *queued*
 holds nothing and simply leaves the queue.
 
 **Timeouts:** a request queued past a configurable ceiling (default 60s)

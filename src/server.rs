@@ -27,6 +27,10 @@ pub struct AppState {
     /// The largest `/v1/chat/completions` request body accepted, in bytes
     /// (replaces axum's 2 MB default; see `--max-request-body-bytes`).
     pub max_request_body_bytes: usize,
+    /// How long the forwarding task waits for a client to accept the next
+    /// body chunk before treating it as gone ([`CLIENT_SEND_TIMEOUT`] in
+    /// production; a field so tests can shorten it).
+    pub client_send_timeout: Duration,
 }
 
 /// The longest a residency request waits on the GPU probe. Past it, `vram`
@@ -257,9 +261,13 @@ async fn chat_completions(
     };
     let (head_tx, head_rx) = tokio::sync::oneshot::channel();
     let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CHUNKS);
-    tokio::spawn(forward(
-        state, body, hint, admission, guard, head_tx, chunk_tx,
-    ));
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let to_client = ToClient {
+        head_tx,
+        chunk_tx,
+        abandoned: abandoned.clone(),
+    };
+    tokio::spawn(forward(state, body, hint, admission, guard, to_client));
 
     // This handler only relays the task's output; if the client goes away,
     // dropping it (and `head_rx`/`chunk_rx`) never cuts the task short.
@@ -286,8 +294,24 @@ async fn chat_completions(
     for (name, value) in head.headers.iter() {
         builder = builder.header(name, value);
     }
-    let chunks = futures::stream::unfold(chunk_rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (chunk, rx))
+    // If the forwarding task gave up on this client for not reading, end
+    // the body with an error once the buffered chunks are out, so the
+    // client sees a broken response rather than a truncated "complete" one.
+    let chunks = futures::stream::unfold(Some(chunk_rx), move |rx| {
+        let abandoned = abandoned.clone();
+        async move {
+            let mut rx = rx?;
+            match rx.recv().await {
+                Some(chunk) => Some((chunk, Some(rx))),
+                None if abandoned.load(Ordering::SeqCst) => Some((
+                    Err(std::io::Error::other(
+                        "aivyx-broker stopped forwarding: the client did not read the response",
+                    )),
+                    None,
+                )),
+                None => None,
+            }
+        }
     });
     builder
         .body(axum::body::Body::from_stream(chunks))
@@ -303,6 +327,25 @@ async fn chat_completions(
 /// How many upstream body chunks the forwarding task may buffer ahead of a
 /// slow client before it waits for the client to catch up.
 const FORWARD_CHANNEL_CHUNKS: usize = 16;
+
+/// How long the forwarding task waits for the client to take the next body
+/// chunk (once [`FORWARD_CHANNEL_CHUNKS`] are already buffered) before it
+/// treats the client as gone and drains llama-server's response on its own.
+/// Without a bound, a client that stays connected but stops reading would
+/// stall the task in `send`, so it would stop reading upstream, reqwest's
+/// read timeout would never fire, and the slot would be held until the
+/// client's TCP connection died.
+pub const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The forwarding task's side of its link to the client-facing handler.
+struct ToClient {
+    /// The response head, or why there is none.
+    head_tx: tokio::sync::oneshot::Sender<Result<UpstreamHead, anyhow::Error>>,
+    /// Body chunks, at most [`FORWARD_CHANNEL_CHUNKS`] buffered.
+    chunk_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    /// Set when the task gives up on a client that stopped reading.
+    abandoned: Arc<AtomicBool>,
+}
 
 /// llama-server's response status and headers, relayed untouched.
 struct UpstreamHead {
@@ -333,20 +376,27 @@ impl Drop for ReleaseGuard {
 
 /// The slot's whole upstream job, run in its own task: warm-up or restore,
 /// the forwarded request, and the response body. Sends the response head on
-/// `head_tx` and the body on `chunk_tx`. When the client has gone away (a
-/// send fails) it keeps reading llama-server's response to the end and
-/// discards it, so the slot (`guard`) is released only once llama-server is
-/// actually done with it. Every early return drops `guard` too.
+/// `to_client.head_tx` and the body on `to_client.chunk_tx`. When the client
+/// has gone away (a send fails) or stopped reading (a send outlasts
+/// `client_send_timeout`, which also sets `abandoned`), it keeps reading
+/// llama-server's response to the end and discards it, so the slot
+/// (`guard`) is released only once llama-server is actually done with it.
+/// Every early return drops `guard` too.
 async fn forward(
     state: AppState,
     mut body: Value,
     hint: Option<crate::SlotHint>,
     admission: crate::Admission,
     guard: ReleaseGuard,
-    head_tx: tokio::sync::oneshot::Sender<Result<UpstreamHead, anyhow::Error>>,
-    chunk_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, reqwest::Error>>,
+    to_client: ToClient,
 ) {
     use futures::StreamExt;
+
+    let ToClient {
+        head_tx,
+        chunk_tx,
+        abandoned,
+    } = to_client;
 
     let resp = match send_upstream(&state, &mut body, &hint, admission).await {
         Ok(resp) => resp,
@@ -367,10 +417,24 @@ async fn forward(
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let failed = chunk.is_err();
-        if let Some(tx) = &client
-            && tx.send(chunk).await.is_err()
-        {
-            client = None;
+        if let Some(tx) = &client {
+            let chunk = chunk.map_err(std::io::Error::other);
+            match tokio::time::timeout(state.client_send_timeout, tx.send(chunk)).await {
+                Ok(Ok(())) => {}
+                // The client hung up.
+                Ok(Err(_)) => client = None,
+                // Connected but not reading: give up on it so upstream keeps
+                // being read (and the slot freed when llama-server is done),
+                // and make its body end in an error rather than look complete.
+                Err(_) => {
+                    tracing::warn!(
+                        slot_id = admission.slot_id,
+                        "client stopped reading; draining llama-server's response without it"
+                    );
+                    abandoned.store(true, Ordering::SeqCst);
+                    client = None;
+                }
+            }
         }
         if failed {
             break;
@@ -540,6 +604,7 @@ mod tests {
             gpu_probe: Arc::new(FakeProbe(None)),
             vram_cache: VramCache::default(),
             max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
+            client_send_timeout: CLIENT_SEND_TIMEOUT,
         };
         (state, dir)
     }
@@ -1220,6 +1285,65 @@ mod tests {
         );
         assert!(r[0].contains("model_a"), "restored {:?}", r[0]);
         assert!(warm_ups(&a2).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connected_client_that_never_reads_does_not_hold_the_slot() {
+        // A streaming upstream that sends far more chunks than the
+        // forwarding channel buffers, then finishes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_done = Arc::new(AtomicBool::new(false));
+        let done = upstream_done.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await;
+            for _ in 0..(FORWARD_CHANNEL_CHUNKS * 4) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let chunk = b"data: {}\n\n";
+                let _ = sock
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await;
+                let _ = sock.write_all(chunk).await;
+                let _ = sock.write_all(b"\r\n").await;
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            done.store(true, Ordering::SeqCst);
+        });
+
+        let (mut state, _dir) = test_state(format!("http://{addr}")).await;
+        state.scheduler = Scheduler::new(1);
+        state.client_send_timeout = Duration::from_millis(200);
+        let app = build_router(state.clone());
+        let body =
+            serde_json::json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]});
+        // Connected, never reads: the response (and its body) stays alive
+        // for the whole test.
+        let response = app.oneshot(chat_request(&body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.scheduler.snapshot()[0].busy {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a stalled client held the slot after upstream could have finished");
+        assert!(upstream_done.load(Ordering::SeqCst));
+        // When it finally reads, the body ends in an error, not as a
+        // truncated response that looks complete.
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

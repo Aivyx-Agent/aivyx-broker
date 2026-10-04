@@ -61,6 +61,13 @@ error against its `base_url`, the same shape as `llama-server` being down.
 | `--max-request-body-bytes` | `AIVYX_BROKER_MAX_REQUEST_BODY_BYTES` | `67108864` (64 MiB) | The largest `/v1/chat/completions` request body accepted; larger requests get `413`. Replaces axum's 2 MB default, which long agent conversations with tool output routinely exceed |
 | `--vram-source` | `AIVYX_BROKER_VRAM_SOURCE` | `auto` | Where `GET /v1/aivyx/residency` reads host GPU memory from: `auto` (`nvidia-smi`, else AMD sysfs), `nvidia`, `amd`, or `none` to report no VRAM |
 
+## Upgrading
+
+KV caches saved by earlier versions of the broker aren't reused after
+upgrading to one that keys saved caches by the request's `model`: each
+prefix gets one cold warm-up on first use, and the old files are never
+read again and age out under the `--kvcache-max-bytes` LRU budget.
+
 ## Pointing a client at the broker
 
 Both `aivyx-pa` and `aivyx-coder` have shipped a broker-aware backend
@@ -141,7 +148,12 @@ broker now owns that).
   reading `llama-server`'s response to the end and only then frees the
   slot, because `llama-server` is still working on it; freeing it early
   would put the next request onto a busy slot. The upstream read timeout
-  (300 s without a byte) bounds how long that can take.
+  (300 s without a byte) bounds how long that can take. A client that
+  stays connected but stops reading is treated the same way once it has
+  left the broker's 16-chunk buffer full for 30 s: the broker drains the
+  rest of the response without it, frees the slot when `llama-server` is
+  done, and ends that client's response with an error rather than a
+  truncated body that looks complete.
 - **No real multi-process race test exists.** This project's own test
   suite has no way to run two genuine OS processes contending for one
   genuine `llama-server` — verified with fakes/mocks only. Manual

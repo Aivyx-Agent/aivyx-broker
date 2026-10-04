@@ -1,5 +1,11 @@
 # aivyx-broker Implementation Plan
 
+> **Historical (as of 2026-10-04):** the `chat_completions`/`handle_admitted`
+> forwarding code below was later restructured: the upstream job now runs
+> in a spawned forward task that owns the slot's `ReleaseGuard`, so a slot
+> is freed when `llama-server` finishes, not when the client disconnects.
+> See the design spec's "Client disconnects" section and `src/server.rs`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build `aivyx-broker`, a standalone loopback-HTTP daemon that both

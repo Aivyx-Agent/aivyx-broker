@@ -32,7 +32,9 @@ The one thing `GpuLock` has that `Scheduler` doesn't: a **max-hold safety
 expiry**. `Scheduler`'s holder is always inside one HTTP request's own
 handler stack (`ReleaseGuard` ties release to that request's response
 stream lifetime, so a crash or disconnect releases it automatically via
-`Drop`). `GpuLock`'s acquire/release are two **separate** HTTP calls from
+`Drop` -- since 2026-10-04 the guard lives in a spawned forward task
+instead, released when `llama-server` finishes rather than on client
+disconnect; see the design spec's "Client disconnects" section). `GpuLock`'s acquire/release are two **separate** HTTP calls from
 an external client (`aivyx-vision-mold`) — a crash between them would hold
 the lock forever with nothing to `Drop`. A background reap task (mirroring
 `main.rs`'s existing `reconcile_seeded_slots` pattern) periodically
