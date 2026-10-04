@@ -37,10 +37,16 @@ pub struct BrokerConfig {
     /// `queue_timeout_secs` (the LLM chat-completion admission queue) --
     /// a GPU generation job can legitimately queue much longer than a
     /// chat turn.
+    ///
+    /// Must stay below every GPU-lock client's own HTTP read timeout
+    /// (Aivyx-Vision's mold backend uses 300s). If the two were equal, a
+    /// lease granted just as the client gave up would go to nobody and stay
+    /// held until the reap task frees it at `gpu_lock_max_hold_secs`. The
+    /// 280s default leaves a 20s margin.
     #[arg(
         long,
         env = "AIVYX_BROKER_GPU_LOCK_QUEUE_TIMEOUT_SECS",
-        default_value_t = 300
+        default_value_t = 280
     )]
     pub gpu_lock_queue_timeout_secs: u64,
 
@@ -85,7 +91,7 @@ mod tests {
         assert_eq!(cfg.kvcache_store_path, PathBuf::from("/tmp/kv"));
         assert_eq!(cfg.kvcache_max_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(cfg.queue_timeout_secs, 60);
-        assert_eq!(cfg.gpu_lock_queue_timeout_secs, 300);
+        assert_eq!(cfg.gpu_lock_queue_timeout_secs, 280);
         assert_eq!(cfg.gpu_lock_max_hold_secs, 900);
     }
 
