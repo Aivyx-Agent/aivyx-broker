@@ -243,47 +243,78 @@ async fn chat_completions(
         }
     };
 
-    // Owns a `Scheduler` clone (cheap -- an `Arc` internally) rather than
-    // borrowing `&state`, specifically so it can be moved into the
-    // streamed response body below and outlive this `async fn`'s own
-    // stack frame, which returns as soon as the `Body` is *constructed*,
-    // well before it's actually drained to the client.
+    // From here on the slot is held. Nothing between `admit` returning and
+    // the guard moving into the spawned task awaits, so a client that hangs
+    // up can't drop the handler in between and leak the slot.
     let guard = ReleaseGuard {
         scheduler: state.scheduler.clone(),
         slot_id: admission.slot_id,
     };
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CHUNKS);
+    tokio::spawn(forward(
+        state, body, hint, admission, guard, head_tx, chunk_tx,
+    ));
 
-    let result = handle_admitted(&state, &mut body, &hint, admission, guard).await;
-
-    match result {
-        Ok(response) => response,
-        Err(err) => {
+    // This handler only relays the task's output; if the client goes away,
+    // dropping it (and `head_rx`/`chunk_rx`) never cuts the task short.
+    let head = match head_rx.await {
+        Ok(Ok(head)) => head,
+        Ok(Err(err)) => {
             tracing::warn!(error = %err, "chat_completions forwarding failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "forwarding task ended without a response"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut builder = axum::response::Response::builder().status(head.status);
+    for (name, value) in head.headers.iter() {
+        builder = builder.header(name, value);
+    }
+    let chunks = futures::stream::unfold(chunk_rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    });
+    builder
+        .body(axum::body::Body::from_stream(chunks))
+        .unwrap_or_else(|err| {
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({"error": err.to_string()})),
             )
                 .into_response()
-        }
-    }
+        })
+}
+
+/// How many upstream body chunks the forwarding task may buffer ahead of a
+/// slow client before it waits for the client to catch up.
+const FORWARD_CHANNEL_CHUNKS: usize = 16;
+
+/// llama-server's response status and headers, relayed untouched.
+struct UpstreamHead {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
 }
 
 /// Releases `slot_id` back to the scheduler on drop.
 ///
-/// Deliberately *not* released via an explicit `scheduler.release(..)`
-/// call right after `handle_admitted` returns: that function returns as
-/// soon as it has *constructed* the streaming response body, not once the
-/// body has actually been drained to the client -- llama-server is still
-/// generating on the slot for the entire streaming window after that
-/// point. Releasing early would let a second request get admitted onto
-/// the same physical slot while the first is still mid-generation,
-/// defeating the entire point of admission control. Instead this guard is
-/// moved into the response stream itself (see `release_on_stream_end`) so
-/// it drops -- and releases -- only once the stream is fully drained or
-/// the client disconnects mid-stream and the stream is dropped early. For
-/// the non-streaming error paths (admission-adjacent HTTP calls failing
-/// before any stream exists), it stays owned by `handle_admitted`'s local
-/// scope and simply drops -- and releases -- when that function returns.
+/// Owned by the spawned [`forward`] task, never by the client-facing
+/// handler: llama-server keeps working on the slot -- warming it up,
+/// restoring it, generating -- whether or not the client is still
+/// listening, so the slot must stay busy until that upstream work has
+/// finished or failed. Were the guard owned by the handler, a client
+/// hanging up would drop it and hand the slot to the next request while
+/// llama-server is still busy with the abandoned one. Dropping (rather
+/// than an explicit `release` call) also covers the task panicking.
 struct ReleaseGuard {
     scheduler: Scheduler,
     slot_id: u32,
@@ -295,44 +326,66 @@ impl Drop for ReleaseGuard {
     }
 }
 
-/// Wraps `inner` so that `guard` is dropped -- releasing the slot --
-/// exactly once, when the stream is exhausted (`None` observed) or when
-/// the returned stream itself is dropped before exhaustion (client
-/// disconnect). Preserves `inner`'s item type unchanged so it satisfies
-/// whatever bound `axum::body::Body::from_stream` needs, identically to
-/// passing `inner` directly.
-fn release_on_stream_end<S>(
-    inner: S,
+/// The slot's whole upstream job, run in its own task: warm-up or restore,
+/// the forwarded request, and the response body. Sends the response head on
+/// `head_tx` and the body on `chunk_tx`. When the client has gone away (a
+/// send fails) it keeps reading llama-server's response to the end and
+/// discards it, so the slot (`guard`) is released only once llama-server is
+/// actually done with it. Every early return drops `guard` too.
+async fn forward(
+    state: AppState,
+    mut body: Value,
+    hint: Option<crate::SlotHint>,
+    admission: crate::Admission,
     guard: ReleaseGuard,
-) -> impl futures::Stream<Item = S::Item> + Send + 'static
-where
-    S: futures::Stream + Send + 'static,
-{
-    futures::stream::unfold(
-        (Box::pin(inner), Some(guard)),
-        |(mut stream, mut guard)| async move {
-            use futures::StreamExt;
-            match stream.next().await {
-                Some(item) => Some((item, (stream, guard))),
-                None => {
-                    // Stream exhausted: drop the guard now (releasing the
-                    // slot) instead of waiting for the unfold combinator
-                    // itself to be dropped later.
-                    guard.take();
-                    None
-                }
-            }
-        },
-    )
+    head_tx: tokio::sync::oneshot::Sender<Result<UpstreamHead, anyhow::Error>>,
+    chunk_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, reqwest::Error>>,
+) {
+    use futures::StreamExt;
+
+    let resp = match send_upstream(&state, &mut body, &hint, admission).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            let _ = head_tx.send(Err(err));
+            return;
+        }
+    };
+    // Relay llama-server's response untouched: real status code, real
+    // headers, real body -- whether it succeeded or not. Deliberately does
+    // *not* call `.error_for_status()`, which would discard the upstream
+    // status/body and collapse every non-2xx into a generic broker error.
+    let head = UpstreamHead {
+        status: resp.status(),
+        headers: resp.headers().clone(),
+    };
+    let mut client = head_tx.send(Ok(head)).is_ok().then_some(chunk_tx);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let failed = chunk.is_err();
+        if let Some(tx) = &client
+            && tx.send(chunk).await.is_err()
+        {
+            client = None;
+        }
+        if failed {
+            break;
+        }
+    }
+    // llama-server is done with the slot: free it before the client sees
+    // the end of the body, so its next request doesn't queue behind itself.
+    drop(guard);
+    drop(client);
 }
 
-async fn handle_admitted(
+/// Prepares `admission`'s slot (warm-up/restore for a hinted request) and
+/// sends `body` to llama-server on it, returning llama-server's response
+/// with its body not yet read.
+async fn send_upstream(
     state: &AppState,
     body: &mut Value,
     hint: &Option<crate::SlotHint>,
     admission: crate::Admission,
-    guard: ReleaseGuard,
-) -> Result<axum::response::Response, anyhow::Error> {
+) -> Result<reqwest::Response, anyhow::Error> {
     match hint {
         Some(h) if !admission.cache_ready => {
             warm_or_restore(state, body, h, admission.slot_id).await?;
@@ -353,7 +406,7 @@ async fn handle_admitted(
         obj.insert("id_slot".to_string(), serde_json::json!(admission.slot_id));
     }
 
-    let resp = state
+    Ok(state
         .http
         .post(format!(
             "{}/v1/chat/completions",
@@ -361,35 +414,7 @@ async fn handle_admitted(
         ))
         .json(body)
         .send()
-        .await?;
-
-    // Relay llama-server's response untouched: real status code, real
-    // headers, real body -- whether it succeeded or not. Deliberately does
-    // *not* call `.error_for_status()`, which would discard the upstream
-    // status/body and collapse every non-2xx into a generic broker error.
-    let status = resp.status();
-    let headers = resp.headers().clone();
-
-    if !status.is_success() {
-        // Non-streaming error path: read the whole body so it can be
-        // forwarded byte-for-byte, then release the slot (via `guard`
-        // dropping at the end of this function) instead of holding it for
-        // a stream that was never started.
-        let bytes = resp.bytes().await?;
-        let mut builder = axum::response::Response::builder().status(status);
-        for (name, value) in headers.iter() {
-            builder = builder.header(name, value);
-        }
-        return Ok(builder.body(axum::body::Body::from(bytes))?);
-    }
-
-    let mut builder = axum::response::Response::builder().status(status);
-    for (name, value) in headers.iter() {
-        builder = builder.header(name, value);
-    }
-    let axum_body =
-        axum::body::Body::from_stream(release_on_stream_end(resp.bytes_stream(), guard));
-    Ok(builder.body(axum_body)?)
+        .await?)
 }
 
 async fn warm_or_restore(
@@ -967,6 +992,120 @@ mod tests {
         );
     }
 
+    fn chat_request(body: &serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_client_disconnect_keeps_the_slot_until_the_upstream_job_finishes() {
+        // The fake llama-server takes 600 ms to answer each request.
+        const UPSTREAM: Duration = Duration::from_millis(600);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(UPSTREAM)
+                    .set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let (mut state, _dir) = test_state(server.uri()).await;
+        state.scheduler = Scheduler::new(1);
+        let app = build_router(state.clone());
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+
+        let start = Instant::now();
+        // Client 1 gives up 100 ms in, while llama-server is still working.
+        let first = tokio::spawn(app.clone().oneshot(chat_request(&body)));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        first.abort();
+        let _ = first.await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            state.scheduler.snapshot()[0].busy,
+            "slot was released while llama-server was still running the abandoned request"
+        );
+
+        // Client 2 must not reach llama-server's slot until job 1 is done,
+        // so it can't finish before two full upstream round trips.
+        let response = app.oneshot(chat_request(&body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= UPSTREAM * 2 - Duration::from_millis(50),
+            "second request finished after {elapsed:?}: it overlapped the abandoned one"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert!(!state.scheduler.snapshot()[0].busy);
+    }
+
+    #[tokio::test]
+    async fn a_client_disconnect_mid_stream_keeps_the_slot_until_the_upstream_stream_ends() {
+        // A real streaming upstream: headers at once, then body chunks over
+        // 600 ms. The client reads the headers and hangs up.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_done = Arc::new(AtomicBool::new(false));
+        let done = upstream_done.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await;
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let chunk = b"data: {}\n\n";
+                let _ = sock
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await;
+                let _ = sock.write_all(chunk).await;
+                let _ = sock.write_all(b"\r\n").await;
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            done.store(true, Ordering::SeqCst);
+        });
+
+        let (mut state, _dir) = test_state(format!("http://{addr}")).await;
+        state.scheduler = Scheduler::new(1);
+        let app = build_router(state.clone());
+        let body =
+            serde_json::json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]});
+        let response = app.oneshot(chat_request(&body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Hang up without reading the stream.
+        drop(response);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            state.scheduler.snapshot()[0].busy,
+            "slot was released while llama-server was still streaming the abandoned request"
+        );
+        // Released once the upstream stream ends.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.scheduler.snapshot()[0].busy {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("slot never released after the upstream stream ended");
+        assert!(upstream_done.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn a_request_larger_than_axums_2mb_default_is_forwarded() {
         let server = MockServer::start().await;
@@ -1108,8 +1247,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        // Drain the streamed body so the `ReleaseGuard` drops and frees
-        // the slot for the next request.
+        // Drain the body: the slot is freed once the forwarding task has
+        // read llama-server's whole response.
         let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

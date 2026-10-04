@@ -132,6 +132,12 @@ broker now owns that).
   waiters race to reclaim it rather than being served in strict order, so
   there's no hard ordering guarantee beyond each request's own queue
   timeout. Priority/weighting is deferred as a future increment.
+- **An abandoned request still holds its slot until `llama-server`
+  finishes it.** If a client hangs up after admission, the broker keeps
+  reading `llama-server`'s response to the end and only then frees the
+  slot, because `llama-server` is still working on it; freeing it early
+  would put the next request onto a busy slot. The upstream read timeout
+  (300 s without a byte) bounds how long that can take.
 - **No real multi-process race test exists.** This project's own test
   suite has no way to run two genuine OS processes contending for one
   genuine `llama-server` — verified with fakes/mocks only. Manual

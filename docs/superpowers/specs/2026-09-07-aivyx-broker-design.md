@@ -102,11 +102,14 @@ Components inside `aivyx-broker`:
   state}`) plus a FIFO wait queue per contested slot and one global FIFO
   queue for "any free slot" requests. Rebuilt from `llama-server`'s real
   `GET /slots` on every broker startup.
-- A thin proxy/forwarder to the real `llama-server`. `reqwest::Response`'s
-  own `bytes_stream()` is already an owned, `'static` stream (unlike
-  mistral.rs's in-process, borrowed `Stream<'_>`), so this is a direct
-  stream-through, not another mpsc-forwarding shim — chunks pass to the
-  client as they arrive, never buffered whole.
+- A thin proxy/forwarder to the real `llama-server`. Each admitted
+  request's upstream job (warm-up/restore, the forwarded request, and
+  reading the response) runs in its own spawned task that owns the slot's
+  release guard; the HTTP handler only relays the task's output through a
+  small bounded channel. Chunks pass to the client as they arrive, never
+  buffered whole. (An earlier version streamed `bytes_stream()` straight
+  into the response body with the guard attached, which released the slot
+  as soon as the client hung up — see "Client disconnects" below.)
 - **The broker owns the full KV-cache restore/warm/save lifecycle, not
   just live slot admission** — a late but important correction made
   during implementation planning. The original per-app flow
@@ -209,6 +212,16 @@ order, not strictly ordered — under contention, a released slot's queued
 waiters race to reclaim it rather than being served in strict order, so
 there's no hard ordering guarantee beyond each request's own queue
 timeout.
+
+**Client disconnects:** a slot is released when `llama-server` is done
+with it, not when the client goes away. If the client hangs up after
+admission — during warm-up/restore, while waiting for the response, or
+mid-stream — the forwarding task keeps reading `llama-server`'s response
+to the end (discarding it) and only then frees the slot; otherwise the
+next request would be admitted onto a slot `llama-server` is still busy
+with. The upstream client's 300s read timeout bounds how long an
+abandoned job can hold it. A client that disconnects while still *queued*
+holds nothing and simply leaves the queue.
 
 **Timeouts:** a request queued past a configurable ceiling (default 60s)
 gets a clear error back rather than hanging forever — the whole reason this

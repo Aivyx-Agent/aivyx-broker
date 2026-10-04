@@ -27,6 +27,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "test-util", "io-util"] }
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6.5"
