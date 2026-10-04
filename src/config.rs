@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// Default for `--max-request-body-bytes`: 64 MiB. Long chat histories
+/// with tool output (or inline images) routinely pass axum's 2 MB default,
+/// and llama-server itself accepts bodies far larger than that.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "aivyx-broker",
@@ -67,6 +72,15 @@ pub struct BrokerConfig {
     )]
     pub gpu_lock_max_hold_secs: u64,
 
+    /// The largest `/v1/chat/completions` request body the broker
+    /// accepts, in bytes. Larger requests get `413 Payload Too Large`.
+    #[arg(
+        long,
+        env = "AIVYX_BROKER_MAX_REQUEST_BODY_BYTES",
+        default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES
+    )]
+    pub max_request_body_bytes: usize,
+
     /// Where `GET /v1/aivyx/residency` reads GPU memory from: `auto`
     /// (nvidia-smi, else AMD sysfs), `nvidia`, `amd`, or `none`.
     #[arg(long, env = "AIVYX_BROKER_VRAM_SOURCE", value_enum, default_value_t = crate::gpu::VramSource::Auto)]
@@ -93,6 +107,7 @@ mod tests {
         assert_eq!(cfg.queue_timeout_secs, 60);
         assert_eq!(cfg.gpu_lock_queue_timeout_secs, 280);
         assert_eq!(cfg.gpu_lock_max_hold_secs, 900);
+        assert_eq!(cfg.max_request_body_bytes, 64 * 1024 * 1024);
     }
 
     #[test]

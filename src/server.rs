@@ -24,6 +24,9 @@ pub struct AppState {
     pub gpu_probe: Arc<dyn crate::gpu::GpuProbe>,
     /// The last `gpu_probe` result, shared by concurrent residency requests.
     pub vram_cache: VramCache,
+    /// The largest `/v1/chat/completions` request body accepted, in bytes
+    /// (replaces axum's 2 MB default; see `--max-request-body-bytes`).
+    pub max_request_body_bytes: usize,
 }
 
 /// The longest a residency request waits on the GPU probe. Past it, `vram`
@@ -125,8 +128,14 @@ impl VramCache {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // axum caps extracted bodies at 2 MB by default; llama-server accepts far
+    // more, and a long agent conversation with tool output passes 2 MB.
+    let body_limit = axum::extract::DefaultBodyLimit::max(state.max_request_body_bytes);
     Router::new()
-        .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).layer(body_limit),
+        )
         .route("/status", get(status))
         .route("/slots", get(slots))
         .route("/v1/aivyx/residency", get(residency))
@@ -490,6 +499,7 @@ mod tests {
             gpu_lock_queue_timeout: Duration::from_secs(5),
             gpu_probe: Arc::new(FakeProbe(None)),
             vram_cache: VramCache::default(),
+            max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         };
         (state, dir)
     }
@@ -955,6 +965,63 @@ mod tests {
             Some(&tools),
             "warm-up request must include the client's real `tools` array"
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_larger_than_axums_2mb_default_is_forwarded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+        let (state, _dir) = test_state(server.uri()).await;
+        let app = build_router(state);
+
+        let big = "x".repeat(3 * 1024 * 1024);
+        let req_body = serde_json::json!({"messages": [{"role": "user", "content": big}]});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let forwarded: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(
+            forwarded["messages"][0]["content"].as_str().unwrap().len(),
+            big.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_over_the_configured_body_limit_is_rejected() {
+        let (mut state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        state.max_request_body_bytes = 1024;
+        let app = build_router(state);
+        let req_body =
+            serde_json::json!({"messages": [{"role": "user", "content": "x".repeat(2048)}]});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

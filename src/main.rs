@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         gpu_lock_queue_timeout: Duration::from_secs(config.gpu_lock_queue_timeout_secs),
         gpu_probe: std::sync::Arc::new(aivyx_broker::gpu::SystemGpuProbe::new(config.vram_source)),
         vram_cache: aivyx_broker::server::VramCache::default(),
+        max_request_body_bytes: config.max_request_body_bytes,
     };
     let app = aivyx_broker::server::build_router(state);
 
