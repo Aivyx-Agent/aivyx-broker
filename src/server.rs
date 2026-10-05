@@ -31,6 +31,10 @@ pub struct AppState {
     /// body chunk before treating it as gone ([`CLIENT_SEND_TIMEOUT`] in
     /// production; a field so tests can shorten it).
     pub client_send_timeout: Duration,
+    /// Extra `Host` header values (hostname/IP, no port) accepted beyond
+    /// loopback -- see `host_guard`. Empty by default: only `localhost`,
+    /// `127.0.0.0/8` and `[::1]` are accepted.
+    pub allowed_hosts: Vec<String>,
 }
 
 /// The longest a residency request waits on the GPU probe. Past it, `vram`
@@ -135,7 +139,7 @@ pub fn build_router(state: AppState) -> Router {
     // axum caps extracted bodies at 2 MB by default; llama-server accepts far
     // more, and a long agent conversation with tool output passes 2 MB.
     let body_limit = axum::extract::DefaultBodyLimit::max(state.max_request_body_bytes);
-    Router::new()
+    let router = Router::new()
         .route(
             "/v1/chat/completions",
             post(chat_completions).layer(body_limit),
@@ -145,7 +149,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/aivyx/residency", get(residency))
         .route("/gpu-lock/acquire", post(gpu_lock_acquire))
         .route("/gpu-lock/release", post(gpu_lock_release))
-        .with_state(state)
+        .with_state(state.clone());
+    // Applied as a router-wide layer (not a per-route one) so every route
+    // is covered, including ones added later without remembering to
+    // annotate them -- see `host_guard`'s doc comment for why this check
+    // exists at all.
+    router.layer(axum::middleware::from_fn_with_state(
+        state,
+        crate::host_guard::enforce_allowed_host,
+    ))
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -605,6 +617,7 @@ mod tests {
             vram_cache: VramCache::default(),
             max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
             client_send_timeout: CLIENT_SEND_TIMEOUT,
+            allowed_hosts: Vec::new(),
         };
         (state, dir)
     }
@@ -621,7 +634,13 @@ mod tests {
 
     async fn get_json(app: Router, uri: &str) -> serde_json::Value {
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -840,6 +859,92 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/status")
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_spoofed_host_header_is_rejected_on_every_route() {
+        // DNS-rebinding guard: a request whose Host names some other
+        // origin entirely must never reach a handler, on any route --
+        // not just /v1/chat/completions.
+        let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let app = build_router(state);
+        for uri in ["/status", "/slots", "/v1/aivyx/residency"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("host", "evil.example")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "uri {uri} did not reject a spoofed Host header"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_host_headers_with_any_port_are_accepted() {
+        let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let app = build_router(state);
+        for host in ["localhost:8899", "127.0.0.1:8899", "[::1]:8899"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/status")
+                        .header("host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "host {host} was rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_host_header_is_rejected() {
+        let (state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_configured_extra_allowed_host_is_accepted() {
+        let (mut state, _dir) = test_state("http://127.0.0.1:1".to_string()).await;
+        state.allowed_hosts = vec!["my-box.lan".to_string()];
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("host", "my-box.lan:8899")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -856,6 +961,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/slots")
+                    .header("host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -901,6 +1007,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body.to_string()))
                     .unwrap(),
@@ -947,6 +1054,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body.to_string()))
                     .unwrap(),
@@ -994,6 +1102,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body.to_string()))
                     .unwrap(),
@@ -1048,6 +1157,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body.to_string()))
                     .unwrap(),
@@ -1076,6 +1186,7 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
+            .header("host", "localhost")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
@@ -1366,6 +1477,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body.to_string()))
                     .unwrap(),
@@ -1394,6 +1506,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body.to_string()))
                     .unwrap(),
@@ -1433,6 +1546,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body.to_string()))
                     .unwrap(),
@@ -1480,6 +1594,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(hinted_body.to_string()))
                     .unwrap(),
@@ -1505,6 +1620,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(hint_less_body.to_string()))
                     .unwrap(),
@@ -1534,6 +1650,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/gpu-lock/acquire")
+                    .header("host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1554,6 +1671,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/gpu-lock/release")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"lease_id": lease_id}).to_string(),
@@ -1584,6 +1702,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/gpu-lock/acquire")
+                    .header("host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1602,6 +1721,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/gpu-lock/release")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"lease_id": uuid::Uuid::new_v4().to_string()})
@@ -1624,6 +1744,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/gpu-lock/release")
+                    .header("host", "localhost")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"lease_id": "not-a-uuid"}).to_string(),

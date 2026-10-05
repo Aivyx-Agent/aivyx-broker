@@ -42,6 +42,16 @@ Binds `127.0.0.1:8899` by default (`--port` to change). Loopback-only, no
 auth — same trust model as `llama-server` itself; not safe to expose
 beyond localhost.
 
+Every route also validates the request's `Host` header, rejecting
+anything that isn't `localhost`, `127.0.0.0/8`, or `[::1]` (any port)
+with `421 Misdirected Request` — otherwise a browser page on some other
+site could reach this loopback-only broker via DNS rebinding (point a
+hostname's DNS at `127.0.0.1`, fetch it from JS; the browser sends that
+hostname as `Host`, not `localhost`, so no same-origin check ever stops
+it). Deliberately binding the broker to a non-loopback address needs its
+real `Host` added via `--allowed-hosts`/`AIVYX_BROKER_ALLOWED_HOSTS`
+below, or every request to it will be rejected.
+
 Start it the same way you'd start `llama-server` itself: manually, before
 the client apps that will use it. There is no auto-spawn in v1 — if the
 broker isn't running, both client apps will simply see a connection-refused
@@ -60,6 +70,7 @@ error against its `base_url`, the same shape as `llama-server` being down.
 | `--gpu-lock-max-hold-secs` | `AIVYX_BROKER_GPU_LOCK_MAX_HOLD_SECS` | `900` | Safety valve: a GPU lock lease held longer than this is force-released by a background reap task, on the assumption its holder crashed or disconnected without releasing. If it fires on a holder that's still alive and running (just slow), the lock is handed to a second waiter while the first is still using the GPU -- set it above your worst-case generation time, not merely the typical one |
 | `--max-request-body-bytes` | `AIVYX_BROKER_MAX_REQUEST_BODY_BYTES` | `67108864` (64 MiB) | The largest `/v1/chat/completions` request body accepted; larger requests get `413`. Replaces axum's 2 MB default, which long agent conversations with tool output routinely exceed |
 | `--vram-source` | `AIVYX_BROKER_VRAM_SOURCE` | `auto` | Where `GET /v1/aivyx/residency` reads host GPU memory from: `auto` (`nvidia-smi`, else AMD sysfs), `nvidia`, `amd`, or `none` to report no VRAM |
+| `--allowed-hosts` | `AIVYX_BROKER_ALLOWED_HOSTS` | *(none)* | Extra `Host` header values (hostname or IP, no port — any port on them is accepted, same as the always-allowed loopback forms) accepted on every route, beyond `localhost`/`127.0.0.0/8`/`[::1]`. Comma-separated; only needed if you deliberately bind `--port` to a non-loopback interface |
 
 ## Upgrading
 

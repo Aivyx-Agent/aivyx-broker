@@ -85,6 +85,17 @@ pub struct BrokerConfig {
     /// (nvidia-smi, else AMD sysfs), `nvidia`, `amd`, or `none`.
     #[arg(long, env = "AIVYX_BROKER_VRAM_SOURCE", value_enum, default_value_t = crate::gpu::VramSource::Auto)]
     pub vram_source: crate::gpu::VramSource,
+
+    /// Extra `Host` header values (hostname or IP, no port) this broker
+    /// accepts on every route, beyond the always-allowed loopback forms
+    /// (`localhost`, `127.0.0.0/8`, `[::1]`, any port). The broker is
+    /// loopback-only by design; this exists only for anyone who
+    /// deliberately binds it to a different address (e.g. a LAN IP) and
+    /// needs its real `Host` to be accepted instead of rejected as a
+    /// possible DNS-rebinding attempt. Comma-separated, e.g.
+    /// `--allowed-hosts my-box.lan,10.0.0.5`.
+    #[arg(long, env = "AIVYX_BROKER_ALLOWED_HOSTS", value_delimiter = ',')]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[cfg(test)]
@@ -108,6 +119,21 @@ mod tests {
         assert_eq!(cfg.gpu_lock_queue_timeout_secs, 280);
         assert_eq!(cfg.gpu_lock_max_hold_secs, 900);
         assert_eq!(cfg.max_request_body_bytes, 64 * 1024 * 1024);
+        assert!(cfg.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn allowed_hosts_parses_a_comma_separated_list() {
+        let cfg = BrokerConfig::parse_from([
+            "aivyx-broker",
+            "--llama-server-url",
+            "http://127.0.0.1:8080",
+            "--kvcache-store-path",
+            "/tmp/kv",
+            "--allowed-hosts",
+            "my-box.lan,10.0.0.5",
+        ]);
+        assert_eq!(cfg.allowed_hosts, vec!["my-box.lan", "10.0.0.5"]);
     }
 
     #[test]

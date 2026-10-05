@@ -42,11 +42,19 @@ cargo run -- --llama-server-url http://127.0.0.1:8080 --kvcache-store-path ~/.lo
 ```
 
 Loopback-only, no auth — same trust model as `llama-server` itself. Not
-safe to expose beyond `127.0.0.1`.
+safe to expose beyond `127.0.0.1`. Every route validates the request's
+`Host` header against a loopback allowlist (`localhost`, `127.0.0.0/8`,
+`[::1]`, any port; see `src/host_guard.rs`) to close the DNS-rebinding
+gap that a bare loopback bind doesn't close on its own — a non-loopback
+`Host` is rejected `421` regardless of which socket the bytes arrived on.
+`--allowed-hosts`/`AIVYX_BROKER_ALLOWED_HOSTS` extends that allowlist for
+anyone who deliberately binds `--port` to a non-loopback address.
 
 ## Known, deliberately-undefended limitations
 
-- Loopback-only, no auth. Not safe to expose beyond `127.0.0.1`.
+- Loopback-only, no auth. Not safe to expose beyond `127.0.0.1` — the
+  `Host`-header check above defends against DNS rebinding specifically,
+  not a substitute for real auth if this is ever exposed more broadly.
 - No priority/weighted scheduling in v1. Admission is approximately FIFO
   by arrival order — under contention, a released slot's queued waiters
   race to reclaim it rather than being served in strict order, so there's

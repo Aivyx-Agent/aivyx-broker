@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         vram_cache: aivyx_broker::server::VramCache::default(),
         max_request_body_bytes: config.max_request_body_bytes,
         client_send_timeout: aivyx_broker::server::CLIENT_SEND_TIMEOUT,
+        allowed_hosts: config.allowed_hosts.clone(),
     };
     let app = aivyx_broker::server::build_router(state);
 
