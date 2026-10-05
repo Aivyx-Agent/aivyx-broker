@@ -50,7 +50,9 @@ hostname's DNS at `127.0.0.1`, fetch it from JS; the browser sends that
 hostname as `Host`, not `localhost`, so no same-origin check ever stops
 it). Deliberately binding the broker to a non-loopback address needs its
 real `Host` added via `--allowed-hosts`/`AIVYX_BROKER_ALLOWED_HOSTS`
-below, or every request to it will be rejected.
+below, or every request to it will be rejected — for example,
+`--allowed-hosts host.docker.internal` for a client running in a Docker
+container that reaches the broker on the host.
 
 Start it the same way you'd start `llama-server` itself: manually, before
 the client apps that will use it. There is no auto-spawn in v1 — if the
