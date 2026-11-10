@@ -26,10 +26,7 @@ async fn main() -> anyhow::Result<()> {
     // enough for realistic prompt-processing + generation stalls without
     // being unbounded. One client, shared by the HTTP routes and the
     // reconciliation task below (Fix 5).
-    let http_client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(300))
-        .build()?;
+    let http_client = aivyx_broker::llama_client::http_client()?;
 
     // Fetch the real slot count first -- the Scheduler is constructed
     // once we know it, then seeded from the same response.

@@ -2,6 +2,19 @@ use serde::Deserialize;
 
 use crate::Scheduler;
 
+/// The client the broker uses for every llama-server request. No proxy:
+/// llama-server is a local service, and reqwest otherwise sends even
+/// loopback requests (prompts included) to `HTTP_PROXY`/`ALL_PROXY` when one
+/// is set (aivyx-vision audit 2026-11-11, X1). The read timeout is
+/// explained where `main.rs` builds the shared client.
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(300))
+        .no_proxy()
+        .build()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlamaClientError {
     #[error("request to llama-server failed: {0}")]
