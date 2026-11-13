@@ -13,11 +13,10 @@ This is not a bug bounty program.
 
 ## Reporting a vulnerability
 
-Two channels:
-- **GitHub Security Advisories** — use the "Report a vulnerability"
-  button under this repo's Security tab (private by default, visible
-  only to maintainers until you choose to publish).
-- **Email** — **jccorbett67@gmail.com** with details.
+Report it privately on GitHub: [Report a vulnerability](https://github.com/Aivyx-Agent/aivyx-broker/security/advisories/new)
+(this repo's **Security** tab). Only the maintainer sees the report
+until a fix is published. Please don't open a public issue for a
+vulnerability.
 
 This is a small, solo-maintained project: reports will be read and
 acknowledged, and we aim to resolve or provide a remediation plan for a
